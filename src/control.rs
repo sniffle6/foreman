@@ -1528,13 +1528,13 @@ pub fn parse_focus_args(
     })
 }
 
-/// Parse `foreman reconnect` args: `<terminal> [--project P]`. The project
-/// defaults to FOREMAN_PROJECT_ID, else the server's focused project. There
-/// is no self-target: a disconnected pane runs nothing that could ask.
-pub fn parse_reconnect_args(
+/// The `<terminal> [--project P]` arguments `reconnect` and `deliver` share:
+/// `(project, terminal)`. `verb` names the command in its own errors.
+fn parse_terminal_target(
+    verb: &str,
     args: &[String],
     default_project: Option<String>,
-) -> Result<ReconnectRequest, String> {
+) -> Result<(Option<String>, String), String> {
     let mut project = None;
     let mut terminal = None;
     let mut i = 0;
@@ -1552,10 +1552,23 @@ pub fn parse_reconnect_args(
             other => return Err(format!("unexpected argument: {other}")),
         }
     }
+    let terminal =
+        terminal.ok_or_else(|| format!("{verb} needs a terminal: foreman {verb} tN"))?;
+    Ok((project.or(default_project), terminal))
+}
+
+/// Parse `foreman reconnect` args: `<terminal> [--project P]`. The project
+/// defaults to FOREMAN_PROJECT_ID, else the server's focused project. There
+/// is no self-target: a disconnected pane runs nothing that could ask.
+pub fn parse_reconnect_args(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<ReconnectRequest, String> {
+    let (project, terminal) = parse_terminal_target("reconnect", args, default_project)?;
     Ok(ReconnectRequest {
         cmd: "reconnect".into(),
-        project: project.or(default_project),
-        terminal: terminal.ok_or("reconnect needs a terminal: foreman reconnect tN")?,
+        project,
+        terminal,
     })
 }
 
@@ -1565,12 +1578,11 @@ pub fn parse_deliver_args(
     args: &[String],
     default_project: Option<String>,
 ) -> Result<DeliverRequest, String> {
-    let r = parse_reconnect_args(args, default_project)
-        .map_err(|e| e.replace("reconnect", "deliver"))?;
+    let (project, terminal) = parse_terminal_target("deliver", args, default_project)?;
     Ok(DeliverRequest {
         cmd: "deliver".into(),
-        project: r.project,
-        terminal: r.terminal,
+        project,
+        terminal,
     })
 }
 
@@ -4826,6 +4838,19 @@ mod tests {
             let e = parse_deliver_args(&s(bad), None).unwrap_err();
             assert!(!e.contains("reconnect"), "{bad:?}: {e}");
         }
+        // An echoed argument comes back as typed, whatever it says.
+        assert_eq!(
+            parse_deliver_args(&s(&["t4", "reconnect-t5"]), None).unwrap_err(),
+            "unexpected argument: reconnect-t5"
+        );
+        assert_eq!(
+            parse_deliver_args(&s(&["--reconnect"]), None).unwrap_err(),
+            "unknown flag: --reconnect"
+        );
+        assert_eq!(
+            parse_deliver_args(&s(&[]), None).unwrap_err(),
+            "deliver needs a terminal: foreman deliver tN"
+        );
         // The line the local pipe reads becomes the GUI message.
         let (tx, rx) = mpsc::channel();
         let gui = std::thread::spawn(move || match rx.recv().unwrap() {

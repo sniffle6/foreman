@@ -318,14 +318,8 @@ pub fn agent_of(argv: &[String]) -> Option<&'static str> {
 /// seen to have both (2026-11-23, Debian: Claude 2.1.331's Bash tool,
 /// codex-cli 0.163.0's shell), and [`prompt_index`] names the prompt. A
 /// brief that starts with `/` is a slash command, whose arguments the note
-/// would become, so it is never carried.
-///
-/// Typed `AtLaunch` only behind a chat hold ([`hooked_claude`]): keys typed
-/// before a hook event can answer a startup dialog (Claude's folder trust
-/// defaults to "No, exit"). Every other agent with arguments (Grok, Codex
-/// with a shape [`prompt_index`] refuses, Claude with its own `--settings`,
-/// anything on a Windows Remote) gets it with its first post, as a bare
-/// agent, a shell or a non-agent command does: a shell would run the note.
+/// would become, so it is never carried. Anything else takes
+/// [`typed_route`].
 pub fn note_route(argv: &[String], shell: RemoteShell) -> crate::control::tunnel::NoteGoes {
     use crate::control::tunnel::NoteGoes;
     if argv.len() < 2 || agent_of(argv).is_none() {
@@ -335,7 +329,26 @@ pub fn note_route(argv: &[String], shell: RemoteShell) -> crate::control::tunnel
     let slash = argv[1].trim_start().starts_with('/');
     if sees_env && !slash && prompt_index(argv).is_some() {
         NoteGoes::InPrompt
-    } else if hooked_claude(argv, shell).is_some() {
+    } else {
+        typed_route(argv, shell)
+    }
+}
+
+/// How the note goes for an agent launched with arguments whose prompt does
+/// not carry it.
+///
+/// A held Claude ([`hooked_claude`]) has it typed behind its hold. Any other
+/// Claude (its own `--settings`, a wrapper such as `npx`, any Windows Remote)
+/// gets it with its first post: nothing reports when its folder-trust
+/// dialog is gone, and a typed note's Enter answers that dialog "No, exit"
+/// (2026-11-24, `claude --settings '{}' "<brief>"`, 5 of 5). Every other
+/// agent (Grok, Codex in a shape [`prompt_index`] refuses, their wrappers)
+/// has it typed at Ready, as before Claude's dialog was found: no dialog of
+/// theirs was seen to quit on it, and a Dispatch may never get a post to
+/// carry it.
+pub fn typed_route(argv: &[String], shell: RemoteShell) -> crate::control::tunnel::NoteGoes {
+    use crate::control::tunnel::NoteGoes;
+    if hooked_claude(argv, shell).is_some() || agent_of(argv) != Some("claude") {
         NoteGoes::AtLaunch
     } else {
         NoteGoes::WithFirstPost
@@ -345,8 +358,10 @@ pub fn note_route(argv: &[String], shell: RemoteShell) -> crate::control::tunnel
 /// How one connection's note goes, from its build's choice: a reconnect that
 /// resumes an agent behind a hold types it once the hold opens (the resumed
 /// conversation still has the dead token's `curl`, and there is no prompt
-/// to carry it). A hookless one waits for its first post like any launch,
-/// since nothing proves it is past a startup dialog.
+/// to carry it). A hookless one goes as [`typed_route`] says for any
+/// launch: a hookless Claude with its first post, anything else at Ready.
+/// Input carried over from the dead connection comes after the typed note,
+/// or carries the note itself ([`crate::terminal::Session::carry_injects`]).
 pub fn connection_note(
     built: crate::control::tunnel::NoteGoes,
     hold: Option<ChatHold>,
@@ -606,6 +621,16 @@ pub enum Opens {
 /// already proven the dialog is gone.
 pub const START_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a hold lasts before its pane shows the held cue. Every launch of
+/// a hooked Claude holds for a moment, and the cue takes a row, so showing it
+/// at once resized the PTY twice while Claude drew its startup screen. A
+/// normal launch must never show it. Measured 2026-11-24 (Claude Code
+/// 2.1.332, Debian Remote, trusted directory, open request to hold open, 9
+/// launches): bare 4.05-4.12 s, a brief 2.5-3.2 s, `--continue` 3.93-4.15 s.
+/// 8 s is about twice the slowest. A hold at a trust dialog waits for a
+/// human, who takes longer; `chat_held` in `status` does not wait for this.
+pub const HELD_CUE_AFTER: std::time::Duration = std::time::Duration::from_secs(8);
+
 impl ChatHold {
     /// What `event` does to this hold. Any event but `SessionStart` comes
     /// from a mounted REPL, so it opens either kind at once.
@@ -672,7 +697,11 @@ pub fn build(l: &Launch) -> Result<Built, String> {
     // Same rule as the hooks themselves ([`ssh_argv`]): nowhere to report
     // without a Tunnel, so no hold.
     let hold = l.tunnel.and_then(|_| hooked_claude(l.argv, l.remote.shell));
-    let note = note_route(l.argv, l.remote.shell);
+    // No Tunnel, no note: say "nothing typed".
+    let note = match l.tunnel {
+        Some(_) => note_route(l.argv, l.remote.shell),
+        None => NoteGoes::WithFirstPost,
+    };
     if note == NoteGoes::InPrompt
         && l.tunnel.is_some()
         && let Some(i) = prompt_index(l.argv)
@@ -695,12 +724,10 @@ pub fn build(l: &Launch) -> Result<Built, String> {
     Ok(Built {
         ssh: ssh_argv(l, l.argv)?,
         dispatched,
-        // A note that would not fit the prompt is typed only behind a hold.
-        // Without a Tunnel there is no hold, so never `AtLaunch` either.
-        note: match (note, hold) {
-            (NoteGoes::InPrompt | NoteGoes::AtLaunch, Some(_)) => NoteGoes::AtLaunch,
-            (NoteGoes::InPrompt | NoteGoes::AtLaunch, None) => NoteGoes::WithFirstPost,
-            (other, _) => other,
+        // A note that would not fit the prompt goes as if it had no prompt.
+        note: match note {
+            NoteGoes::InPrompt => typed_route(l.argv, l.remote.shell),
+            other => other,
         },
         hold,
     })
@@ -1850,8 +1877,9 @@ mod tests {
     }
 
     /// Per agent and shell: where the reply note goes and which hold the
-    /// launch gets. Nothing is typed at launch without a hold, since only a
-    /// hook event proves the agent is past a startup dialog.
+    /// launch gets. Nothing is typed into a Claude without a hold, since only
+    /// a hook event proves it is past its folder-trust dialog; every other
+    /// agent whose prompt cannot carry the note has it typed at Ready.
     #[test]
     fn the_reply_note_s_route_per_agent_and_shell() {
         use crate::control::tunnel::NoteGoes::{AtLaunch, InPrompt, WithFirstPost};
@@ -1890,7 +1918,7 @@ mod tests {
                 Some(UntilStart),
             ),
             (&["claude", "/cost"], Posix, AtLaunch, Some(UntilStart)),
-            (&["codex", "/status now"], Posix, WithFirstPost, None),
+            (&["codex", "/status now"], Posix, AtLaunch, None),
             // A hooked Claude foreman cannot place the note for: typed,
             // behind the hold.
             (&["claude", "hi"], Posix, AtLaunch, Some(UntilPrompt)),
@@ -1902,8 +1930,8 @@ mod tests {
                 Some(UntilPrompt),
             ),
             (&["claude", "agents"], Posix, AtLaunch, Some(UntilPrompt)),
-            // Hookless: no hold, so nothing typed; the first post carries it.
-            (&["grok", brief], Posix, WithFirstPost, None),
+            // Hookless Claude: no hold, so nothing typed; the first post
+            // carries it.
             (
                 &["claude", "--settings", "{}", brief],
                 Posix,
@@ -1916,22 +1944,28 @@ mod tests {
                 WithFirstPost,
                 None,
             ),
-            (&["codex", "exec", brief], Posix, WithFirstPost, None),
-            (&["codex", "hi"], Posix, WithFirstPost, None),
             (
                 &["npx", "@anthropic-ai/claude-code", brief],
                 Posix,
                 WithFirstPost,
                 None,
             ),
-            // Windows: no hooks, no tool shell seen.
             (&["claude", brief], Pwsh, WithFirstPost, None),
-            (&["codex", brief], WindowsPowerShell, WithFirstPost, None),
-            (&["grok", brief], Pwsh, WithFirstPost, None),
-            // A reconnect's resume argv: typed only behind a hold.
+            (&["claude", "hi"], WindowsPowerShell, WithFirstPost, None),
+            // Any other agent its prompt cannot carry the note for: typed at
+            // Ready, with no hold.
+            (&["grok", brief], Posix, AtLaunch, None),
+            (&["grok", "hi"], Posix, AtLaunch, None),
+            (&["codex", "exec", brief], Posix, AtLaunch, None),
+            (&["codex", "hi"], Posix, AtLaunch, None),
+            (&["/usr/bin/codex", brief], Posix, AtLaunch, None),
+            (&["npx", "@openai/codex", brief], Posix, AtLaunch, None),
+            (&["codex", brief], WindowsPowerShell, AtLaunch, None),
+            (&["grok", brief], Pwsh, AtLaunch, None),
+            // A reconnect's resume argv.
             (&["claude", "--continue"], Posix, AtLaunch, Some(UntilStart)),
-            (&["codex", "resume", "--last"], Posix, WithFirstPost, None),
             (&["claude", "--continue"], Pwsh, WithFirstPost, None),
+            (&["codex", "resume", "--last"], Posix, AtLaunch, None),
             // Bare agent, shell, non-agent command: the first post.
             (&["claude"], Posix, WithFirstPost, Some(UntilStart)),
             (&["codex"], Pwsh, WithFirstPost, None),
@@ -1942,8 +1976,8 @@ mod tests {
             let a = argv(words);
             assert_eq!(note_route(&a, *shell), *note, "{words:?} on {shell:?}");
             assert_eq!(hooked_claude(&a, *shell), *hold, "{words:?} on {shell:?}");
-            if *note == AtLaunch {
-                assert!(hold.is_some(), "typed only behind a hold: {words:?}");
+            if *note == AtLaunch && agent_of(&a) == Some("claude") {
+                assert!(hold.is_some(), "a Claude is typed into only behind a hold: {words:?}");
             }
             if a.is_empty() {
                 continue;
@@ -1952,13 +1986,14 @@ mod tests {
             let b = build(&launch(&remote(*shell), "", &a)).unwrap();
             assert_eq!((b.note, b.hold), (*note, *hold), "{words:?} on {shell:?}");
         }
-        // No reconnect argv carries it, and none is typed without a hold.
+        // No reconnect argv carries it, and no Claude is typed into without
+        // a hold.
         for (words, shell, ..) in table {
             let re = relaunch(&argv(words));
             let hold = hooked_claude(&re.argv, *shell);
             let note = connection_note(note_route(&re.argv, *shell), hold, true);
             assert_ne!(note, InPrompt, "{words:?}");
-            if note == AtLaunch {
+            if note == AtLaunch && re.agent == Some("claude") {
                 assert!(hold.is_some(), "{words:?} on {shell:?}");
             }
         }

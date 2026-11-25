@@ -328,9 +328,10 @@ word or many, bare or by path), or for a bare launch, `--continue` and a
 slash command, a fixed settle after `SessionStart` so the REPL has mounted
 (Results, 2026-11-24). Nothing opens the hold before an event, and no
 keystroke opens it: the human's first keys answer the dialog. While it
-holds, `status --json` carries `chat_held: true` and the pane shows a cue
-on its bottom line with one action, "deliver now", which opens it, as does
-the local-only `foreman deliver tN`, for an agent whose events never come.
+holds, `status --json` carries `chat_held: true`. Once the hold has lasted
+`remote::HELD_CUE_AFTER`, the pane shows a cue on its bottom line with one
+action, "deliver now", which opens it. So does the local-only
+`foreman deliver tN`, for an agent whose events never come.
 A hookless agent has no hold: its posts go at Ready, so a post sent while
 its own startup dialog shows can answer it. Holding it with no signal would
 stall unattended dispatch into trusted directories.
@@ -826,6 +827,70 @@ afc3660; AFTER adds this change.
   unit-tested; how it looks needs a human), Grok (not installed), Windows
   Remotes (none exist), a dropped hook event followed by a later one
   (unit-tested: every event but `SessionStart` opens either hold).
+
+## Results, 2026-11-24, the note before carried posts, the hookless launch note, the cue
+
+Release builds ran as their own instances (own `APPDATA`, agent environment
+stripped), driven through their pipes against the Debian Remote (Claude Code
+2.1.332, Codex 0.163.0 then 0.172.0, see below). Every run used a new
+`/tmp` directory. BEFORE is 4934798; AFTER is this change. A post counts as
+delivered when the transcript holds it as a typed prompt or a queued one.
+Agent-state badges were off (the default): the room then hands a Session
+its whole backlog in one tick, and posts 2..n wait 500 ms each in the
+Session's own queue, which is what a drop carries over.
+
+- **H**: Claude by path with a brief (held, note typed), 6 posts held
+  through the trust dialog, the dialog answered with `send`, its `ssh.exe`
+  stopped by PID about 1 s after the hold opened, then `foreman reconnect`.
+  **C**: `codex -c model_reasoning_effort=low "<brief>"` (a shape
+  `prompt_index` refuses), its brief asking it to report READY at once, 60 s
+  left alone, then 6 posts, `ssh.exe` stopped 0.9 s after the first, then
+  `foreman reconnect`.
+
+| Item | Run | BEFORE | AFTER |
+|---|---|---|---|
+| 1 | H, carried posts answered with the dead token first | 3 of 3 | 0 of 3 |
+| 1 | H, fresh note ahead of every carried post | 0 of 3 | 3 of 3 |
+| 1 | C, fresh note ahead of every carried post | 0 of 1 | 2 of 2 |
+| 2 | C, can report before anyone posts to it | 0 of 2 | 2 of 2 |
+| 4 | normal launch (trusted directory), pane resized by the cue | 9 of 9 | 0 of 8 |
+| 4 | held at the dialog past the threshold, failures | not run | 0 of 10 |
+
+- **H BEFORE.** The resumed Claude got the carried posts, then the fresh
+  note last. It answered with the dead token and port
+  (`curl: (7) Failed to connect`), and posted again once the late note came.
+  Two more BEFORE runs carried nothing: the stop landed after every post
+  was written. **H AFTER**: all 13 carried posts were answered in the room
+  on the live token.
+- **C.** Codex's own sandbox refused every `curl` in these directories
+  (exit 7, the new port listening), as recorded above, so its commands are
+  the evidence. BEFORE C2 carried two posts with no note. The fresh note
+  came only with a later post from the room, and Codex tried the dead token
+  too. AFTER, the note came first and only the live token was used. Item 2
+  BEFORE: Codex searched for a chat command and wrote "The project chat
+  command hasn't been provided". AFTER: the note was typed once after its
+  brief, and it ran the report `curl` with it.
+- **BEFORE C1 updated Codex on the Remote.** On reconnect,
+  `codex resume --last` showed its update prompt. The carried posts' paste
+  and Enter picked "Update now": `npm install -g @openai/codex` ran
+  (0.163.0 to 0.172.0) and Codex exited. The typed note at Ready that item
+  2 restores does the same whenever an update is pending.
+- **Item 4 timings** (open request to hold open, trusted directory): bare
+  4.05-4.12 s, a brief 2.1-3.2 s, `--continue` 3.51-4.15 s, 17 launches over
+  both builds. `HELD_CUE_AFTER` = 8 s. BEFORE every one of them drew the cue,
+  then dropped it as the hold opened (40 to 41 rows). AFTER the pane kept one
+  size (47 rows) from its first frame.
+- **Item 4 at the dialog** (6 with a brief, 4 bare; 3 with a held post of
+  1150 emoji, 4.6 KB on one line). At 3 s the dialog was drawn whole at 47
+  rows, and at 10.5 s with the cue up it was whole at 45. After the answer
+  the REPL was drawn at 47 rows. Each held post arrived exactly once, the
+  long ones intact. Two bare runs did not reply: there the post is Claude's
+  first prompt, which it read as pasted content.
+- **Found, not fixed.** Posts already pasted into a busy agent sit in its
+  own memory and die with it on a drop. foreman counts them delivered. Up to
+  4 per run were lost this way, in both builds.
+- Unverified: how the cue looks (needs a human), Grok (not installed),
+  Windows Remotes (none exist).
 
 ## Order of work
 

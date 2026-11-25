@@ -104,10 +104,13 @@ process is there, and it is an ordinary member of THIS project's chat.
   `curl` command that posts to this room, naming `$FOREMAN_URL` and
   `$FOREMAN_TOKEN`, which its tool shell has. A Claude whose brief starts
   with `/`, or one in a shape foreman cannot place it in, gets it typed once its
-  hooks report it started. Every other agent (Grok, Codex in another shape,
-  Claude with a `--settings` of yours, anything on a Windows Remote, a bare
-  agent) gets it with its first chat post, the token written out. Nothing is
-  typed into them at launch: keys then can answer a startup dialog. It joins
+  hooks report it started. Grok and Codex in another shape get it typed once
+  the pane shows output. **A Claude with no hooks (a `--settings` of yours,
+  a wrapper such as `npx`, anything on a Windows Remote) cannot reply until
+  you post to it:** nothing is typed into it at launch, since keys then
+  answer its trust dialog "No, exit", so its first chat post carries the
+  note. Post to it once (for example "report here when done"). A bare agent
+  also gets the note with its first post. It joins
   the room at its end: posts made before it opened never
   reach it. Ask it to report by chat and leave the foreman commands out of
   its brief.
@@ -133,8 +136,10 @@ process is there, and it is an ordinary member of THIS project's chat.
   holds. Never before: the held input would answer the dialog.
 - Hookless agents on R (Codex, Grok, Claude with your `--settings`, Windows
   Remotes) are not held. A post to one is typed once its pane shows output,
-  so a post sent while its trust dialog shows answers it. Open them in a
-  directory they trust, or post only after the human has answered.
+  so a post sent while its trust dialog shows answers it, and so does
+  Codex's typed note: Enter at Codex's "update available" prompt picks
+  "Update now", which runs `npm install -g` on R and exits Codex. Open them
+  in a directory they trust, or post only after the human has answered.
 - In `status --json` its line carries `remote` (the Remote's name). Its ssh
   dropping shows as `state: exited` with `disconnected: true`: the pane
   waits for the human's Enter to reconnect, and foreman never reconnects by

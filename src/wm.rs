@@ -3777,8 +3777,9 @@ impl WindowManager {
         // A held agent gets the note typed once its hold opens: a resumed one
         // still has the dead token's curl command in its conversation and
         // would use it, 401, until a post came. There is no prompt to carry
-        // it (resume drops it). A hookless agent and a shell wait for a post:
-        // nothing proves the agent is past a dialog, and a shell would run it.
+        // it (resume drops it). A hookless Claude and a shell wait for a post:
+        // nothing proves Claude is past its dialog, and a shell would run it.
+        // Any other agent has it typed at Ready (`remote::typed_route`).
         let mut fresh =
             self.spawn_remote_session(&argv, &remote, &dir, id, re.agent.is_some(), ctx)?;
         fresh.set_term_id(id);
@@ -3794,9 +3795,11 @@ impl WindowManager {
         else {
             return Ok(());
         };
-        // Chat input the dead connection never wrote goes to the fresh one.
+        // Chat input the dead connection never wrote goes to the fresh one,
+        // after the fresh note or carrying it, never ahead of it: the dead
+        // token would answer it with a 401.
         if let Content::Terminal(old) = &mut t.content {
-            fresh.queue_injects_front(old.take_pending_injects());
+            fresh.carry_injects(old.take_pending_injects());
         }
         // The dead Session drops here, and its job with it.
         t.content = Content::Terminal(fresh);
@@ -13115,22 +13118,33 @@ mod tests {
         assert!(notes.contains_text("desk"), "a toast says why");
     }
 
-    /// Kill `command`'s Remote Session and press Enter on its bar: the fresh
-    /// Session's queued input, and whether a chat delivery still carries
-    /// the reply note.
-    fn reconnected(
+    /// Kill `command`'s Remote Session on a `shell` Remote, with `posts`
+    /// delivered to it and still unwritten, and press Enter on its bar: the
+    /// fresh Session's queued input, and whether a chat delivery still
+    /// carries the reply note.
+    fn reconnected_with(
+        shell: crate::remote::RemoteShell,
+        posts: &[&str],
         open: impl FnOnce(&mut WindowManager, &crate::remote::Remote, &egui::Context) -> WinId,
     ) -> (Vec<String>, bool) {
         let mut wm = WindowManager::new();
         let pid = push(&mut wm, "proj");
         let ctx = egui::Context::default();
         seed_desk_remote(&ctx);
+        let mut settings = (*crate::config::live(&ctx)).clone();
+        settings.remotes[0].shell = shell;
+        crate::config::seed_live(&ctx, &settings);
         let (tx, _rx) = std::sync::mpsc::channel();
         crate::control::tunnel::install(&ctx, tx, std::sync::mpsc::sync_channel(1).0);
         let remote = crate::config::live(&ctx).remotes[0].clone();
         let child = wm.project_child_mut(pid).unwrap();
         let tid = open(child, &remote, &ctx);
         let s = child.terminal_session_mut(tid).unwrap();
+        let dead = s.tunnel_token().map(str::to_string);
+        // Never pumped, so never Ready: these wait on the dead connection.
+        for p in posts {
+            s.inject_chat(p);
+        }
         s.kill_for_test();
         s.request_reconnect_for_test();
         wm.refresh_reconnects(&ctx);
@@ -13141,26 +13155,40 @@ mod tests {
             .unwrap();
         assert!(!s.disconnected(), "reconnected");
         let token = s.tunnel_token().expect("a new lease").to_string();
+        assert_ne!(dead.as_deref(), Some(token.as_str()), "a new token");
         let queued = s.pending_injects().to_vec();
         for q in queued.iter().filter(|q| q.contains("[foreman] You run on")) {
             assert!(q.contains(&token), "only the new token is taught: {q}");
+            if let Some(dead) = &dead {
+                assert!(!q.contains(dead.as_str()), "the dead note is gone: {q}");
+            }
         }
         (queued, s.reply_note_waits())
     }
 
+    fn reconnected(
+        open: impl FnOnce(&mut WindowManager, &crate::remote::Remote, &egui::Context) -> WinId,
+    ) -> (Vec<String>, bool) {
+        reconnected_with(crate::remote::RemoteShell::Posix, &[], open)
+    }
+
     #[test]
-    fn an_agent_reconnect_types_the_reply_note_once_only_behind_a_hold() {
+    fn an_agent_reconnect_types_the_reply_note_once_except_a_hookless_claude() {
         // The first launch carried the note in its prompt, or typed it, so
         // the dead connection may have queued its own copy: that one is not
         // carried over. A held Claude (`claude --continue`) gets the fresh
-        // note typed once its hold opens; a hookless agent has nothing that
-        // proves it is past a dialog, so its first post carries it.
-        for (words, typed) in [
-            (&["claude", "hi"][..], true),
-            (&["codex", "do the card"], false),
-            (&["npx", "@openai/codex", "do the card"], false),
+        // note typed once its hold opens, and Codex at Ready; a hookless
+        // Claude has nothing that proves it is past its trust dialog, so its
+        // first post carries it.
+        use crate::remote::RemoteShell::{Posix, Pwsh};
+        for (words, shell, typed) in [
+            (&["claude", "hi"][..], Posix, true),
+            (&["codex", "do the card"], Posix, true),
+            // A wrapper comes back as the bare agent, fresh: the first post.
+            (&["npx", "@openai/codex", "do the card"], Posix, false),
+            (&["claude", "do the card"], Pwsh, false),
         ] {
-            let (queued, waits) = reconnected(|wm, remote, ctx| {
+            let (queued, waits) = reconnected_with(shell, &[], |wm, remote, ctx| {
                 let argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
                 wm.add_remote_terminal(&argv, remote, "/tmp", None, ctx)
                     .expect("ssh spawns")
@@ -13172,6 +13200,54 @@ mod tests {
             assert_eq!(notes, usize::from(typed), "{words:?}: {queued:?}");
             assert_eq!(waits, !typed, "{words:?}: exactly one route");
         }
+    }
+
+    /// Posts queued on a dead connection reach the fresh one in order, after
+    /// its typed note or carrying it, never ahead of it: a resumed agent
+    /// would answer them with the dead token. One note per connection.
+    #[test]
+    fn a_reconnect_teaches_the_fresh_token_before_any_carried_post() {
+        use crate::remote::RemoteShell::{Posix, Pwsh};
+        let is_note = |q: &String| q.starts_with("[foreman] You run on");
+        for (words, shell) in [
+            // Held: the note is typed once the hold opens.
+            (&["claude", "hi"][..], Posix),
+            (&["claude"], Posix),
+            // Hookless, typed at Ready.
+            (&["codex", "do the card"], Posix),
+            (&["codex", "exec", "do the card"], Posix),
+        ] {
+            let (queued, waits) = reconnected_with(shell, &["post 1", "post 2"], |wm, remote, ctx| {
+                let argv: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+                wm.add_remote_terminal(&argv, remote, "/tmp", None, ctx)
+                    .expect("ssh spawns")
+            });
+            assert_eq!(queued.len(), 3, "{words:?}: {queued:?}");
+            assert!(is_note(&queued[0]), "{words:?}: note first: {queued:?}");
+            assert_eq!(queued[1..], ["post 1", "post 2"], "{words:?}");
+            assert!(!waits, "{words:?}: one note");
+        }
+        // Hookless Claude and a shell: the first carried post carries it.
+        let (queued, waits) = reconnected_with(Pwsh, &["post 1", "post 2"], |wm, remote, ctx| {
+            wm.add_remote_terminal(&["claude".into(), "do the card".into()], remote, "/tmp", None, ctx)
+                .expect("ssh spawns")
+        });
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert!(queued[0].starts_with("post 1
+
+[foreman] You run on"), "{queued:?}");
+        assert_eq!(queued[1], "post 2");
+        assert!(!waits, "one note");
+        let (queued, waits) = reconnected_with(Posix, &["post 1", "post 2"], |wm, remote, ctx| {
+            use crate::remote_dir_prompt::{Place, What};
+            wm.open_remote_win(remote, "/tmp", What::Shell, Place::Default, ctx)
+                .expect("ssh spawns")
+        });
+        assert!(queued[0].starts_with("post 1
+
+[foreman] You run on"), "{queued:?}");
+        assert_eq!(queued[1..], ["post 2"]);
+        assert!(!waits);
     }
 
     /// A first launch on a Remote: what is typed into the pane before
@@ -13422,13 +13498,24 @@ mod tests {
             assert!(queued[0].starts_with("[foreman] You run on"), "{queued:?}");
             assert!(!waits, "{words:?}");
         }
-        // Hookless (no hold): nothing typed, since keys at launch can answer
-        // a dialog. The first post carries it. A bare agent, a shell and a
-        // non-agent command likewise.
+        // Any other agent whose prompt cannot carry it: typed at Ready, no
+        // hold.
         for words in [
             &["codex", "exec", "do the card"][..],
-            &["npx", "@anthropic-ai/claude-code", "do the card"],
+            &["codex", "hi"],
             &["grok", "do the card"],
+        ] {
+            let (queued, waits) = first_launch(words);
+            assert_eq!(queued.len(), 1, "{words:?}: {queued:?}");
+            assert!(queued[0].starts_with("[foreman] You run on"), "{queued:?}");
+            assert!(!waits, "{words:?}");
+        }
+        // A hookless Claude: nothing typed, since keys at launch answer its
+        // trust dialog. The first post carries it. A bare agent, a shell and
+        // a non-agent command likewise.
+        for words in [
+            &["npx", "@anthropic-ai/claude-code", "do the card"][..],
+            &["claude", "--settings", "{}", "do the card"],
             &["claude"],
             &[],
             &["htop", "-d", "5"],

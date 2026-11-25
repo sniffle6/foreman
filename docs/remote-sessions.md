@@ -111,8 +111,8 @@ is for changing the feature.
 - **Anything typed before Claude's folder-trust dialog is answered quits
   Claude.** The dialog's default is "No, exit", and the Enter that ends any
   injected text picks it. Four things keep input out of it. A first launch
-  whose note rides in its prompt types nothing. A note is typed at launch
-  only behind a hold (`remote::note_route`); every other agent gets it with
+  whose note rides in its prompt types nothing. A Claude has its note typed
+  only behind a hold (`remote::typed_route`); a hookless Claude gets it with
   its first post. A Remote Session's first launch joins the room at its end
   (`ChatRoom::join_at_end`), so it gets no catch-up. A Claude launched with
   hooks holds every post and typed note (`remote::ChatHold`,
@@ -123,7 +123,14 @@ is for changing the feature.
 - **A keystroke never opens a hold.** The first keys a human presses in a
   held pane are the ones that answer the trust dialog, so releasing then
   would type into it. Only the cue's "deliver now" click and
-  `foreman deliver tN` open it by hand (`Session::release_chat_hold`).
+  `foreman deliver tN` open it by hand (`Session::release_chat_hold`). The
+  action's sense has no focus (`HELD_CUE_SENSE`), so Tab, Enter and Space
+  cannot reach it even if focus handling changes.
+- **The held cue waits `HELD_CUE_AFTER` before it shows.** It takes a row
+  from the grid, and every hooked Claude launch holds for 2-4 s, so showing
+  it at once resized the PTY twice while Claude drew its startup screen
+  (seen on every launch, 2026-11-24). Its strip is not grid: a press or a
+  drag that starts there sends no mouse bytes and selects nothing.
 - **`SessionStart` comes before the REPL can read a long line.** After the
   dialog the tty is in cooked mode until the REPL mounts, and Linux drops a
   line over 4095 bytes there. Seen 2026-11-24 (Claude Code 2.1.331): a held
@@ -144,10 +151,11 @@ is for changing the feature.
   event (the lane is a bounded `try_send`) with nothing after it, and a
   subcommand that stays open (`claude agents`: a first argument counts as a
   brief, and it fired `SessionStart` but never `UserPromptSubmit`). Its posts
-  stay in the room and its typed note stays queued. The pane shows a cue on
-  its bottom line ("Chat held until claude has started — deliver now"),
-  `status --json` carries `chat_held: true`, and the cue's click or
-  `foreman deliver tN` sends it all in order. Any later hook event still
+  stay in the room and its typed note stays queued. `status --json`
+  carries `chat_held: true` at once. Once the hold has lasted
+  `remote::HELD_CUE_AFTER` (8 s) the pane shows a cue on its bottom line
+  ("Chat waiting until claude is ready — deliver now"), and the cue's click
+  or `foreman deliver tN` sends it all in order. Any later hook event still
   opens it: every event but `SessionStart` comes from a mounted REPL.
 - **Known limit: a hookless Remote agent's chat goes at Ready.** Codex,
   Grok, Claude with the user's own `--settings`, a wrapper and anything on a
@@ -155,9 +163,16 @@ is for changing the feature.
   pasted once the pane is Ready, which a trust dialog already is. A post
   sent while one shows answers it ("No, exit" for Claude). Holding them
   with no signal would stall unattended dispatch into trusted directories
-  forever, and a hold only a human can open is worse than the dialog. What
-  they do get: no note typed at launch, so a Dispatch alone cannot quit
-  them.
+  forever, and a hold only a human can open is worse than the dialog. A
+  hookless Claude gets no note typed at launch, so a Dispatch alone cannot
+  quit it, and it cannot post until it is posted to. Codex and Grok get the
+  note typed at Ready, since a Dispatch may never get a post to carry it.
+- **Typed input at Ready can answer Codex's update prompt.** Seen
+  2026-11-24: a reconnect's `codex resume --last` showed "update available"
+  and the carried posts' paste and Enter picked its default. Codex ran
+  `npm install -g @openai/codex` on the Remote (0.163.0 to 0.172.0) and
+  exited. A typed note at Ready does the same whenever an update is
+  pending. Nothing reports that prompt, so foreman cannot wait it out.
 - **Claude keeps only the last `--settings`.** With two, only the last
   one's hooks ran, and hooks then `{}` ran none (2026-11-24, Claude Code
   2.1.331, `claude -p`). So foreman cannot add its hooks beside the user's
@@ -175,7 +190,7 @@ is for changing the feature.
   the bare program and then the brief, with `--model <id>` the one tail it
   allows. The brief must hold whitespace. No subcommand of the three CLIs
   does, so this needs no subcommand list that drifts between CLI versions. A
-  one-word brief therefore gets the typed note. On top of that,
+  one-word brief therefore gets the note another way. On top of that,
   `remote::note_route` carries the note only for `claude` and `codex` on a
   Posix Remote, never in a brief that starts with `/`: the note became
   `/context`'s arguments (2026-11-24). Those are the only tool shells seen
@@ -186,12 +201,21 @@ is for changing the feature.
   the hold opens (`remote::connection_note`). The resume argv has no prompt
   to carry the note (`relaunch` drops the original prompt), and a resumed
   agent still has the old `curl` command in its conversation, so it would
-  get 401 until a post came. A resumed hookless agent (`codex resume
-  --last`) does get 401 until then: nothing proves it is past a dialog, so
-  its first post carries the note. A shell reconnect waits for the first
-  post too: a shell would run the note as commands. Input
-  queued on the dead connection is carried over without its note
-  (`ReplyNote::strip`), or the agent would be taught the dead token too.
+  get 401 until a post came. A resumed Codex (`codex resume --last`) has it
+  typed at Ready. A resumed hookless Claude and a shell wait for the first
+  post: nothing proves Claude is past its dialog, and a shell would run the
+  note as commands. Input queued on the dead connection is carried over
+  without its note (`ReplyNote::strip`), after the fresh typed note or
+  carrying the fresh note itself (`Session::carry_injects`). Ahead of it, a
+  resumed Claude answered the carried posts with the dead token and port
+  (2026-11-24, 3 of 3 runs).
+- **What a reconnect carries is the Session's own queue, not the room.** The
+  room hands a post over only when the Session can take it. Without
+  agent-state badges (the default) it hands over the whole backlog in one
+  tick, and posts 2..n wait `ready::SUBMIT_DELAY` (500 ms) each in the
+  Session's queue. A drop then carries them. Posts already pasted into a
+  busy agent wait in its own memory and die with it on a drop: foreman
+  counts them delivered (seen 2026-11-24, up to 4 posts in a run).
 - **The forwarded port is open to everyone on the Remote.** Any user or
   process there can connect to it. The token is the only credential, and it
   sits base64-encoded on the `ssh` command line on both PCs. On Linux any user
