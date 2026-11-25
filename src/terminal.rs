@@ -1213,9 +1213,25 @@ impl Session {
         std::mem::take(&mut self.reconnect_requested)
     }
 
+    /// Test hook: one pump at `now`, so a test can step past a timed release.
+    #[cfg(test)]
+    pub fn pump_at_for_test(&mut self, now: std::time::Instant) {
+        self.pump_at(now);
+    }
+
     #[cfg(test)]
     pub fn request_reconnect_for_test(&mut self) {
         self.reconnect_requested = true;
+    }
+
+    /// Test hook: make an unspawned Session look connected (`connected`) or
+    /// local (`remote: false`), with no process behind it.
+    #[cfg(test)]
+    pub fn reshape_for_test(&mut self, remote: bool, connected: bool) {
+        if !remote {
+            self.remote = None;
+        }
+        self.exit = (!connected).then_some(0);
     }
 
     /// Test hook: end the child and wait until `exited` has seen it, so a
@@ -1527,11 +1543,29 @@ impl Session {
     }
 
     /// A hook event named this Session. If it opens the hold, held input
-    /// goes out in order.
+    /// goes out in order, now or [`crate::remote::START_SETTLE`] after a
+    /// `SessionStart` (whichever event comes first wins).
     pub fn hook_arrived(&mut self, event: crate::agent_state::HookEvent) {
-        if self.chat_hold.is_some_and(|h| h.opened_by(event)) {
-            self.chat_hold = None;
-            self.ready_gate.release();
+        self.hook_arrived_at(event, std::time::Instant::now());
+    }
+
+    /// [`Self::hook_arrived`] at `now`, for tests.
+    pub(crate) fn hook_arrived_at(
+        &mut self,
+        event: crate::agent_state::HookEvent,
+        now: std::time::Instant,
+    ) {
+        use crate::remote::Opens;
+        match self.chat_hold.map(|h| h.on_event(event)) {
+            Some(Opens::Now) => {
+                self.chat_hold = None;
+                self.ready_gate.release();
+            }
+            Some(Opens::AfterSettle) => {
+                self.ready_gate
+                    .release_at(now + crate::remote::START_SETTLE);
+            }
+            Some(Opens::No) | None => {}
         }
     }
 

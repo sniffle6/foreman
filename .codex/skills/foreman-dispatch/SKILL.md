@@ -148,13 +148,14 @@ process is there, and it is an ordinary member of THIS project's chat.
   Idle and `status` never says idle: snapshot to see where they are. A
   first launch in a directory Claude has not trusted shows no state while
   the trust dialog waits. Nothing is typed into a Remote Claude until its
-  hooks report it past the dialog (its brief submitted, or a bare one
-  started), so posts to it wait and arrive in order once the human answers
-  the dialog. Ask the human to answer it, or use a directory it trusts.
+  hooks report it past the dialog (its brief submitted, or 2 s after a bare
+  one started), so posts to it wait and arrive in order once the human
+  answers the dialog. Ask the human to answer it, or use a directory it trusts.
 - In `status --json` its line carries `remote` (the Remote's name). Its ssh
   dropping shows as `state: exited` with `disconnected: true`: the pane
   waits for the human's Enter to reconnect, and Foreman never reconnects by
-  itself. Until then `chat --to` it fails as exited.
+  itself. `reconnect tN` does what that Enter does, from this PC only; use
+  it when the human asks. Until then `chat --to` it fails as exited.
 - A reconnected agent resumes its last conversation (Claude, Codex) without
   its original prompt or flags, or starts fresh. Re-brief it by chat.
 - A Windows Remote may refuse a long prompt for its command-line limit. Do

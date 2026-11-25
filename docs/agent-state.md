@@ -124,13 +124,16 @@ take the local hook lane from there.
   `UserPromptSubmit` → working, tool calls stay working, `Stop` → idle,
   `PermissionRequest` → needs you, approving → working (`PostToolUse`) →
   idle. The remote `~/.claude/settings.json` was unchanged. Reconnect was
-  checked by unit test only: `send` cannot press Enter on a disconnect bar.
+  driven live on 2026-11-24 with `foreman reconnect`: the resumed Claude's
+  `SessionStart` reached foreman on the new token (it opened the hold on the
+  fresh note), and the agent posted back on that token.
 - **Folder trust is not Needs you.** Claude runs no hook until the folder is
   trusted, so a first launch in a new Remote directory shows no badge while
   the trust dialog waits.
 - **`SessionStart` maps to no state.** Only the Remote launch hooks send it,
-  and it leaves the badge as it was. Its one use is to open the Session's
-  chat hold, which keeps typed input out of the trust dialog
+  and it leaves the badge as it was. Its one use is the Session's chat hold,
+  which keeps typed input out of the trust dialog: it opens a launch with no
+  brief `remote::START_SETTLE` later, once the REPL has mounted
   (`docs/remote-sessions.md`). The local helper refuses
   `--event SessionStart`, because no local handler sends it.
 - **Subagents never send `Stop`.** In 2.1.331 a subagent's end is

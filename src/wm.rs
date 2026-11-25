@@ -2008,6 +2008,21 @@ impl WindowManager {
                     }
                 }
             }
+            CtrlMsg::Reconnect(req, reply, sent) => {
+                if sent.elapsed() >= REPLY_TIMEOUT {
+                    return;
+                }
+                let _ = reply.send(match self.reconnect_dispatch(&req, ctx) {
+                    Ok((pid, tid)) => OpenReply {
+                        ok: true,
+                        project: Some(format!("p{pid}")),
+                        terminal: Some(term_tag(tid)),
+                        ..Default::default()
+                    },
+                    Err(e) => OpenReply::err(e),
+                });
+                ctx.request_repaint();
+            }
             CtrlMsg::View(req, reply, sent) => {
                 if sent.elapsed() >= REPLY_TIMEOUT {
                     return;
@@ -2985,6 +3000,29 @@ impl WindowManager {
             }
         });
         self.pending_settles = settles;
+    }
+
+    /// `foreman reconnect`: what Enter on a disconnect bar does
+    /// ([`Self::refresh_reconnects`]), for a Remote Session whose connection
+    /// is down. Anything else is refused, never reconnected.
+    fn reconnect_dispatch(
+        &mut self,
+        req: &crate::control::ReconnectRequest,
+        ctx: &egui::Context,
+    ) -> Result<(WinId, WinId), String> {
+        let terminal = req.terminal.as_str();
+        let (pid, tid) = self.resolve_terminal(req.project.as_deref(), terminal)?;
+        let session = self.session(pid, tid)?;
+        let Some(remote) = session.remote() else {
+            return Err(format!("{terminal} is not a Remote Session"));
+        };
+        if !session.disconnected() {
+            return Err(format!(
+                "{terminal} on {remote} is connected; only a disconnected Remote Session reconnects"
+            ));
+        }
+        self.project_child_mut(pid)?.reconnect(tid, ctx)?;
+        Ok((pid, tid))
     }
 
     fn send_dispatch(
@@ -12871,6 +12909,63 @@ mod tests {
         assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
     }
 
+    /// `foreman reconnect` refuses anything but a disconnected Remote
+    /// Session, and for one does what Enter on the bar does: here the Remote
+    /// is not in settings, so it answers the same error Enter would toast,
+    /// without spawning anything.
+    #[test]
+    fn the_reconnect_verb_takes_only_a_disconnected_remote_session() {
+        let ctx = egui::Context::default();
+        crate::config::seed_live(&ctx, &crate::config::Settings::default());
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
+        let child = wm.project_child_mut(pid).unwrap();
+        for (id, remote, connected) in [(7, false, false), (8, true, true), (9, true, false)] {
+            let mut s = crate::terminal::Session::disconnected_remote(
+                "gone",
+                None,
+                Some("/tmp"),
+                ctx.clone(),
+            );
+            s.set_term_id(id);
+            s.reshape_for_test(remote, connected);
+            child.push_win(id, Tab::fixed("t", Content::Terminal(s)), r);
+        }
+        let ask = |terminal: &str| crate::control::ReconnectRequest {
+            cmd: "reconnect".into(),
+            project: Some(format!("p{pid}")),
+            terminal: terminal.into(),
+        };
+        let err = wm.reconnect_dispatch(&ask("t7"), &ctx).unwrap_err();
+        assert_eq!(err, "t7 is not a Remote Session");
+        let err = wm.reconnect_dispatch(&ask("t8"), &ctx).unwrap_err();
+        assert!(err.contains("t8 on gone is connected"), "{err}");
+        let err = wm.reconnect_dispatch(&ask("t99"), &ctx).unwrap_err();
+        assert!(err.contains("no such terminal"), "{err}");
+        // The disconnected one reaches `reconnect`, whose own error comes back.
+        let err = wm.reconnect_dispatch(&ask("t9"), &ctx).unwrap_err();
+        assert!(
+            err.contains("no Remote named \"gone\""),
+            "reconnect's lookup answered: {err}"
+        );
+        // Through the GUI channel: the same answers, and a stale request is
+        // dropped unanswered, as for every verb.
+        let via = |wm: &mut WindowManager, t: &str, sent: std::time::Instant| {
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            wm.handle_ctrl(crate::control::CtrlMsg::Reconnect(ask(t), rtx, sent), &ctx);
+            rrx.try_recv()
+        };
+        let r = via(&mut wm, "t7", std::time::Instant::now()).expect("a reply");
+        assert!(!r.ok);
+        assert_eq!(r.error.as_deref(), Some("t7 is not a Remote Session"));
+        let stale = std::time::Instant::now() - crate::control::REPLY_TIMEOUT;
+        assert!(via(&mut wm, "t9", stale).is_err(), "a stale request is dropped");
+        let child = wm.project_child_mut(pid).unwrap();
+        assert!(child.terminal_session(9).unwrap().disconnected());
+        assert!(!child.terminal_session(8).unwrap().disconnected());
+    }
+
     #[test]
     fn a_reconnect_to_a_deleted_remote_stays_disconnected_with_a_toast() {
         let mut wm = WindowManager::new();
@@ -13107,17 +13202,28 @@ mod tests {
         wm.apply_hook_event(&hook_event("p99", briefed, UserPromptSubmit));
         assert!(held(&mut wm, briefed));
         // A briefed Claude is past the dialog at SessionStart, but its REPL
-        // may not read input yet: only its prompt's submit opens it.
-        wm.apply_hook_event(&hook_event(&tag, briefed, SessionStart));
-        assert!(
-            held(&mut wm, briefed),
-            "SessionStart does not open a brief's hold"
-        );
+        // may not read input yet: only its prompt's submit opens it, one
+        // word or many.
+        for id in [briefed, typed] {
+            wm.apply_hook_event(&hook_event(&tag, id, SessionStart));
+            assert!(
+                held(&mut wm, id),
+                "SessionStart does not open a brief's hold"
+            );
+        }
         wm.apply_hook_event(&hook_event(&tag, briefed, UserPromptSubmit));
         assert!(!held(&mut wm, briefed));
-        // A bare Claude has nothing later: SessionStart opens it, and only it.
+        // A bare Claude has nothing later: SessionStart opens it once the
+        // REPL has had START_SETTLE to mount.
         wm.apply_hook_event(&hook_event(&tag, bare, SessionStart));
-        assert!(!held(&mut wm, bare));
+        // Taken after the event, so its deadline is at most t + START_SETTLE.
+        let t = std::time::Instant::now();
+        let child = wm.project_child_mut(pid).unwrap();
+        let s = child.terminal_session_mut(bare).unwrap();
+        s.pump_at_for_test(t);
+        assert!(s.chat_held(), "still mounting");
+        s.pump_at_for_test(t + crate::remote::START_SETTLE + std::time::Duration::from_millis(50));
+        assert!(!s.chat_held(), "opened after the settle");
         assert!(held(&mut wm, typed));
         // A typed note queued behind the hold keeps its place.
         let child = wm.project_child_mut(pid).unwrap();
@@ -13164,13 +13270,19 @@ mod tests {
         );
         let queued = s.pending_injects().to_vec();
         assert_eq!(queued.len(), 1, "the fresh typed note, held: {queued:?}");
-        // `claude --continue` has no prompt: its SessionStart opens it.
+        // `claude --continue` has no prompt: its SessionStart opens it, once
+        // the REPL has had START_SETTLE to mount.
         wm.apply_hook_event(&hook_event(&tag, id, SessionStart));
+        // Taken after the event, so its deadline is at most t + START_SETTLE.
+        let t = std::time::Instant::now();
         let s = wm
             .project_child_mut(pid)
             .unwrap()
             .terminal_session_mut(id)
             .unwrap();
+        s.pump_at_for_test(t);
+        assert!(s.chat_held(), "still mounting");
+        s.pump_at_for_test(t + crate::remote::START_SETTLE + std::time::Duration::from_millis(50));
         assert!(!s.chat_held());
         s.kill_for_test();
     }

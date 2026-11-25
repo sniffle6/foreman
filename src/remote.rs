@@ -543,34 +543,98 @@ pub struct Built {
 /// Which hook event opens a hooked Remote Claude's chat hold. Claude runs no
 /// hook while its folder-trust dialog waits, and any Enter typed there quits
 /// it, so no input goes before an event. `SessionStart` is the first one
-/// past the dialog, but its REPL is still mounting then: a post pasted at it
-/// was lost once in three tries (2026-11-23, Claude Code 2.1.331; the other
-/// two were echoed by the tty and then read). A launch whose brief rides in
-/// argv also fires `UserPromptSubmit` for it, and only a mounted REPL does,
-/// so it waits for that. A bare launch or `--continue` has nothing later.
+/// past the dialog, but the REPL mounts after it ([`START_SETTLE`]). A launch
+/// whose brief Claude submits at launch also fires `UserPromptSubmit`, which
+/// only a mounted REPL sends, so it waits for that. A bare launch,
+/// `--continue` and a slash command may send nothing later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatHold {
-    /// Any event opens it, `SessionStart` included.
+    /// Any event but `SessionStart` opens it at once; `SessionStart` opens
+    /// it [`START_SETTLE`] later.
     UntilStart,
-    /// Any event but `SessionStart` opens it.
+    /// Any event but `SessionStart` opens it; `SessionStart` does not.
     UntilPrompt,
 }
 
+/// What a hook event does to a [`ChatHold`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opens {
+    /// Held input goes now.
+    Now,
+    /// Held input goes [`START_SETTLE`] from now, unless a later event opens
+    /// it sooner.
+    AfterSettle,
+    /// Still held.
+    No,
+}
+
+/// How long after `SessionStart` a [`ChatHold::UntilStart`] hold opens.
+/// `SessionStart` proves the folder-trust dialog is past, but the REPL is not
+/// mounted yet. After the dialog the tty is back in cooked mode until then,
+/// and Linux drops a line over 4095 bytes there: a held post of 1150 emoji
+/// (4.6 KB on one line) released at `SessionStart` was lost 5 times in 5, and
+/// arrived 3 in 3 sent to a mounted REPL; short input is buffered and
+/// survives (2026-11-24, Claude Code 2.1.331, Debian). Measured with a pty on
+/// the Remote over 53 launches (bare, one-word and multi-word brief,
+/// `--continue`): the REPL turned bracketed paste back on 0.098-0.185 s after
+/// `SessionStart` and painted its footer at 0.180-0.267 s. 2 s is 7.5x the
+/// slowest paint, for slower Remotes. It is not a blind timer: the hook has
+/// already proven the dialog is gone.
+pub const START_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl ChatHold {
-    /// Whether `event` opens this hold.
-    pub fn opened_by(self, event: crate::agent_state::HookEvent) -> bool {
-        self == Self::UntilStart || event != crate::agent_state::HookEvent::SessionStart
+    /// What `event` does to this hold. Any event but `SessionStart` comes
+    /// from a mounted REPL, so it opens either kind at once.
+    pub fn on_event(self, event: crate::agent_state::HookEvent) -> Opens {
+        match (self, event == crate::agent_state::HookEvent::SessionStart) {
+            (_, false) => Opens::Now,
+            (Self::UntilStart, true) => Opens::AfterSettle,
+            (Self::UntilPrompt, true) => Opens::No,
+        }
     }
 }
 
-/// [`Built::hold`] for `argv`: only Claude's launch hooks report anything on
-/// a Remote ([`claude_with_hooks`]).
-fn chat_hold(argv: &[String], shell: RemoteShell) -> Option<ChatHold> {
-    claude_with_hooks(argv, shell)?;
-    Some(if prompt_index(argv).is_some() {
-        ChatHold::UntilPrompt
-    } else {
-        ChatHold::UntilStart
+/// Whether a Remote launch of `argv` carries Claude's state hooks, and so
+/// which chat hold it gets: `None` = no hooks and no hold. The one predicate
+/// for both ([`claude_with_hooks`], [`Built::hold`]), so a hooked launch is
+/// always held and a held one always reports the event that opens it.
+///
+/// Hooks ride only Claude itself, by its file stem (`claude`,
+/// `/home/u/.npm-global/bin/claude`), on a Posix Remote, without the user's
+/// own `--settings`. A wrapper gets none, as with
+/// [`crate::agent_command::codex_in_process`]. Windows is unproved, and the
+/// encoded hooks would take ~3 KB of the brief's room under
+/// [`WINDOWS_LINE_CAP`].
+///
+/// `UntilPrompt` when the first argument is a brief Claude submits at launch,
+/// one word or many, by path or bare: its `UserPromptSubmit` follows. This is
+/// wider than [`prompt_index`], which decides what may be REWRITTEN and stays
+/// strict. A subcommand looks like a brief (`claude mcp list`), but it runs
+/// no hooks, so its hold never opens as either kind. Not a brief, so
+/// `UntilStart`: a flag first
+/// (`--continue`, `--model x …`), nothing, an empty argument, and a
+/// slash command (2026-11-24, Claude Code 2.1.331: `/cost` and `/context`
+/// fired no `UserPromptSubmit`, `/init` did).
+pub fn hooked_claude(argv: &[String], shell: RemoteShell) -> Option<ChatHold> {
+    let (program, rest) = argv.split_first()?;
+    let stem = std::path::Path::new(program).file_stem()?.to_str()?;
+    if shell != RemoteShell::Posix
+        || !stem.eq_ignore_ascii_case("claude")
+        || rest
+            .iter()
+            .any(|a| a == "--settings" || a.starts_with("--settings="))
+    {
+        return None;
+    }
+    Some(match rest.first() {
+        Some(brief)
+            if !brief.trim().is_empty()
+                && !brief.trim_start().starts_with('-')
+                && !brief.trim_start().starts_with('/') =>
+        {
+            ChatHold::UntilPrompt
+        }
+        _ => ChatHold::UntilStart,
     })
 }
 
@@ -579,7 +643,9 @@ fn chat_hold(argv: &[String], shell: RemoteShell) -> Option<ChatHold> {
 pub fn build(l: &Launch) -> Result<Built, String> {
     use crate::control::tunnel::NoteGoes;
     let dispatched = l.argv.to_vec();
-    let hold = l.tunnel.and_then(|_| chat_hold(l.argv, l.remote.shell));
+    // Same rule as the hooks themselves ([`ssh_argv`]): nowhere to report
+    // without a Tunnel, so no hold.
+    let hold = l.tunnel.and_then(|_| hooked_claude(l.argv, l.remote.shell));
     let note = note_route(l.argv, l.remote.shell);
     if note == NoteGoes::InPrompt
         && l.tunnel.is_some()
@@ -711,21 +777,9 @@ const PAYLOAD_EVENTS: &[&str] = &["UserPromptSubmit", "Stop", "StopFailure"];
 /// `argv` with Claude's state hooks as `--settings` JSON after the program:
 /// one `curl` per event to the Tunnel's `/hook`, the token read from the
 /// launch environment (never written into argv, which every user on the
-/// Remote can read). `None` when the program is not Claude itself (a wrapper
-/// gets no hooks, as with [`crate::agent_command::codex_in_process`]), the
-/// user passed their own `--settings`, or the Remote is Windows: unproved
-/// there, and the encoded hooks would take ~3 KB of the brief's room under
-/// [`WINDOWS_LINE_CAP`].
+/// Remote can read). `None` exactly when [`hooked_claude`] says no hooks.
 fn claude_with_hooks(argv: &[String], shell: RemoteShell) -> Option<Vec<String>> {
-    let stem = std::path::Path::new(argv.first()?).file_stem()?.to_str()?;
-    if shell != RemoteShell::Posix
-        || !stem.eq_ignore_ascii_case("claude")
-        || argv[1..]
-            .iter()
-            .any(|a| a == "--settings" || a.starts_with("--settings="))
-    {
-        return None;
-    }
+    hooked_claude(argv, shell)?;
     let mut hooks = serde_json::Map::new();
     for &event in crate::agent_hooks::state_events("claude")
         .iter()
@@ -1944,57 +1998,105 @@ mod tests {
         assert!(built > 60, "the table must build: {built}");
     }
 
-    /// Only a launch carrying Claude's hooks holds chat, a launch with its
-    /// brief in argv until the brief is submitted, and its hooks include the
-    /// one that fires first past the trust dialog.
+    /// The one table for which Remote launches carry Claude's hooks and which
+    /// hold they get: hooks and hold always agree, a brief Claude submits at
+    /// launch waits for its prompt however it is spelled, and widening the
+    /// hold never widens what [`prompt_index`] may rewrite.
     #[test]
-    fn only_a_hooked_claude_launch_holds_chat_and_a_briefed_one_waits_for_its_prompt() {
-        use crate::agent_state::HookEvent;
+    fn hooks_and_hold_come_from_one_predicate() {
         use ChatHold::{UntilPrompt, UntilStart};
         let posix = remote(RemoteShell::Posix);
-        for (words, hold) in [
-            (&["claude", "do the card"][..], Some(UntilPrompt)),
+        // (argv, hold = hooks, prompt_index)
+        for (words, hold, rewrite) in [
+            (&["claude", "do the card"][..], Some(UntilPrompt), Some(1)),
             (
                 &["claude", "do the card", "--model", "x"],
                 Some(UntilPrompt),
+                Some(1),
             ),
-            (&["claude"], Some(UntilStart)),
-            (&["claude", "--continue"], Some(UntilStart)),
-            // A prompt foreman cannot place: the first event, as for bare.
-            (&["claude", "hi"], Some(UntilStart)),
-            (&["claude", "--settings", "mine.json"], None),
-            (&["npx", "@anthropic-ai/claude-code"], None),
-            (&["codex", "do the card"], None),
-            (&["grok", "do the card"], None),
-            (&[], None),
+            (&["claude", "hi"], Some(UntilPrompt), None),
+            (
+                &["/home/u/.npm-global/bin/claude", "do the card"],
+                Some(UntilPrompt),
+                None,
+            ),
+            (&["/usr/local/bin/claude", "hi"], Some(UntilPrompt), None),
+            (&["Claude", "do the card"], Some(UntilPrompt), None),
+            (&["claude"], Some(UntilStart), None),
+            (&["/usr/local/bin/claude"], Some(UntilStart), None),
+            (&["claude", "--continue"], Some(UntilStart), None),
+            (
+                &["claude", "--model", "x", "do the card"],
+                Some(UntilStart),
+                None,
+            ),
+            (&["claude", ""], Some(UntilStart), None),
+            (&["claude", "  "], Some(UntilStart), Some(1)),
+            (&["claude", "/cost"], Some(UntilStart), None),
+            (&["claude", "  /cost"], Some(UntilStart), Some(1)),
+            (&["claude", "/review this"], Some(UntilStart), Some(1)),
+            (&["claude", "--settings", "mine.json"], None, None),
+            (&["claude", "hi", "--settings=mine.json"], None, None),
+            (&["npx", "@anthropic-ai/claude-code"], None, None),
+            (&["my-claude", "do the card"], None, None),
+            (&["codex", "do the card"], None, Some(1)),
+            (&["grok", "do the card"], None, Some(1)),
+            (&[], None, None),
         ] {
             let a = argv(words);
+            assert_eq!(hooked_claude(&a, RemoteShell::Posix), hold, "{words:?}");
             assert_eq!(
-                build(&launch(&posix, "", &a)).unwrap().hold,
-                hold,
-                "{words:?}"
+                claude_with_hooks(&a, RemoteShell::Posix).is_some(),
+                hold.is_some(),
+                "hooks and hold agree: {words:?}"
             );
+            assert_eq!(
+                prompt_index(&a),
+                rewrite,
+                "rewrite rule unchanged: {words:?}"
+            );
+            if !a.is_empty() {
+                assert_eq!(
+                    build(&launch(&posix, "", &a)).unwrap().hold,
+                    hold,
+                    "{words:?}"
+                );
+            }
         }
         for shell in [RemoteShell::Pwsh, RemoteShell::WindowsPowerShell] {
-            let a = argv(&["claude"]);
+            let a = argv(&["claude", "do the card"]);
+            assert_eq!(hooked_claude(&a, shell), None);
             assert_eq!(build(&launch(&remote(shell), "", &a)).unwrap().hold, None);
         }
-        let every = [
-            HookEvent::SessionStart,
+    }
+
+    /// Any event but `SessionStart` comes from a mounted REPL and opens
+    /// either hold now; `SessionStart` starts the settle for a launch with
+    /// no brief and does nothing for one whose prompt is still to come.
+    #[test]
+    fn what_each_hook_event_does_to_each_hold() {
+        use crate::agent_state::HookEvent;
+        use ChatHold::{UntilPrompt, UntilStart};
+        for e in [
             HookEvent::UserPromptSubmit,
             HookEvent::PermissionRequest,
             HookEvent::PostToolUse,
             HookEvent::Stop,
             HookEvent::StopFailure,
-        ];
-        for e in every {
-            assert!(UntilStart.opened_by(e), "{e:?}");
-            assert_eq!(
-                UntilPrompt.opened_by(e),
-                e != HookEvent::SessionStart,
-                "{e:?}"
-            );
+            HookEvent::Interrupt,
+        ] {
+            assert_eq!(UntilStart.on_event(e), Opens::Now, "{e:?}");
+            assert_eq!(UntilPrompt.on_event(e), Opens::Now, "{e:?}");
         }
+        assert_eq!(
+            UntilStart.on_event(HookEvent::SessionStart),
+            Opens::AfterSettle
+        );
+        assert_eq!(UntilPrompt.on_event(HookEvent::SessionStart), Opens::No);
+    }
+
+    #[test]
+    fn the_hooks_include_the_event_that_fires_first_past_the_dialog() {
         let with = claude_with_hooks(&argv(&["claude"]), RemoteShell::Posix).unwrap();
         let settings: serde_json::Value = serde_json::from_str(&with[2]).unwrap();
         let start = settings["hooks"][REMOTE_GATE_EVENT][0]["hooks"][0]["command"]

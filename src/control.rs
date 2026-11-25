@@ -304,6 +304,17 @@ pub struct FocusRequest {
     pub terminal: Option<String>, // "t4"; None = the project tab itself
 }
 
+/// Reconnect a disconnected Remote Session: what Enter on its disconnect bar
+/// does. Local pipe only: a peer may not send it ([`REMOTE_VERBS`]) and the
+/// Tunnel has no route that builds it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ReconnectRequest {
+    pub cmd: String, // always "reconnect"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>, // "p2"; None = focused project
+    pub terminal: String, // "t4"
+}
+
 /// Kanban board verb (spec: kanban-board §wire shape). `action` selects the
 /// operation; unused fields are omitted on the wire so a plain `list`
 /// request stays minimal and future v1 additions don't affect old callers.
@@ -439,6 +450,11 @@ pub enum CtrlMsg {
     Send(SendRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Snapshot(SnapshotRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Focus(FocusRequest, mpsc::Sender<OpenReply>, std::time::Instant),
+    Reconnect(
+        ReconnectRequest,
+        mpsc::Sender<OpenReply>,
+        std::time::Instant,
+    ),
     View(ViewRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     Kanban(KanbanRequest, mpsc::Sender<OpenReply>, std::time::Instant),
     /// Settings are App-owned, so `App::service_background` answers this one
@@ -589,6 +605,9 @@ fn dispatch_line(
                 .map_err(|e| format!("bad request: {e}")),
             "focus" => serde_json::from_str::<FocusRequest>(line)
                 .map(|r| CtrlMsg::Focus(r, rtx, now))
+                .map_err(|e| format!("bad request: {e}")),
+            "reconnect" => serde_json::from_str::<ReconnectRequest>(line)
+                .map(|r| CtrlMsg::Reconnect(r, rtx, now))
                 .map_err(|e| format!("bad request: {e}")),
             "view" => serde_json::from_str::<ViewRequest>(line)
                 .map(|r| CtrlMsg::View(r, rtx, now))
@@ -1489,6 +1508,37 @@ pub fn parse_focus_args(
     })
 }
 
+/// Parse `foreman reconnect` args: `<terminal> [--project P]`. The project
+/// defaults to FOREMAN_PROJECT_ID, else the server's focused project. There
+/// is no self-target: a disconnected pane runs nothing that could ask.
+pub fn parse_reconnect_args(
+    args: &[String],
+    default_project: Option<String>,
+) -> Result<ReconnectRequest, String> {
+    let mut project = None;
+    let mut terminal = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--project" => {
+                project = Some(args.get(i + 1).ok_or("--project needs a value")?.clone());
+                i += 2;
+            }
+            other if other.starts_with('-') => return Err(format!("unknown flag: {other}")),
+            other if terminal.is_none() => {
+                terminal = Some(other.to_string());
+                i += 1;
+            }
+            other => return Err(format!("unexpected argument: {other}")),
+        }
+    }
+    Ok(ReconnectRequest {
+        cmd: "reconnect".into(),
+        project: project.or(default_project),
+        terminal: terminal.ok_or("reconnect needs a terminal: foreman reconnect tN")?,
+    })
+}
+
 /// Parse `foreman view` args: `[--project P] <path.png>`. Resolves the path to
 /// an absolute, canonicalized form CLIENT-side (the GUI may run with a
 /// different cwd) and strips Windows' `\\?\` verbatim prefix so the stored/
@@ -2234,6 +2284,7 @@ USAGE
   foreman send [flags] --text TXT / --keys \"K...\"  drive input into a terminal
   foreman snapshot [--project P] [--terminal T] [--tail N]  read viewport or last N buffer lines
   foreman focus [--project P] [--terminal T]  bring a project or terminal tab to the front
+  foreman reconnect <tN> [--project P]      reconnect a disconnected Remote Session
   foreman icat <file.png> [--cols N]        print an image into this pane (kitty graphics)
   foreman view <file.png> [--project P]     open a persistent image-viewer window
   foreman kanban <action> ...                add/list/start/dispatch/edit/done/block/rm/wait a card
@@ -2244,8 +2295,8 @@ USAGE
   foreman remotes                           list the Remotes open --on can run a Session on
   foreman help | --help | -h                this text (also: open --help, chat --help,
                                             status --help, close --help, send --help,
-                                            snapshot --help, focus --help, view --help,
-                                            kanban --help)
+                                            snapshot --help, focus --help,
+                                            reconnect --help, view --help, kanban --help)
 
 Subcommands talk to the RUNNING foreman instance over its control pipe; they
 print a JSON reply on stdout and exit 0 (ok), 1 (foreman refused or is
@@ -2351,9 +2402,9 @@ project, terminal, title, agent (claude|codex|grok), state (running|exited),
 exit_code, chat (bool), placement, ready (bool: takes input yet),
 agent_state (working|needs_you|idle, from the agent's hooks), remote
 (the Remote's name, Remote Sessions only), and disconnected (true while a
-Remote Session's connection is down and waits for Enter to reconnect; its
-state still reads exited). A missing
-field means unknown, not a default: no agent_state is not idle.
+Remote Session's connection is down and waits for Enter or foreman
+reconnect; its state still reads exited). A missing field means unknown,
+not a default: no agent_state is not idle.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 const HELP_CLOSE: &str = "\
@@ -2411,6 +2462,19 @@ drop a zoom that would cover it, and focus it.
 This takes the keyboard from whatever the human is typing into. Only the
 foreman window's contents change; it does not raise foreman over other apps.
 Reply: {\"ok\":true,\"project\":\"pN\"}, plus \"terminal\":\"tN\" for a terminal.
+Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
+
+const HELP_RECONNECT: &str = "\
+foreman reconnect <tN> [--project P]
+
+Reconnect Remote Session tN in project P (default: your FOREMAN_PROJECT_ID,
+else the focused project), exactly as Enter on its disconnect bar does: a
+new ssh connection to the same Remote and directory, a new token, the agent
+resumed (claude --continue, codex resume --last) and the reply note typed
+for it. Refused for a local Session and for a Remote Session that is still
+connected. Only this PC's pipe takes it: a peer (--host) or a Remote agent
+cannot reconnect a pane.
+Reply: {\"ok\":true,\"project\":\"pN\",\"terminal\":\"tN\"}.
 Exit codes: 0 ok, 1 refused/unreachable, 2 bad arguments.";
 
 const HELP_VIEW: &str = "\
@@ -2579,6 +2643,7 @@ pub fn client_main(args: &[String]) -> i32 {
         Some("send") => send_main(&args[1..]),
         Some("snapshot") => snapshot_main(&args[1..]),
         Some("focus") => focus_main(&args[1..]),
+        Some("reconnect") => reconnect_main(&args[1..]),
         Some("icat") => crate::icat::icat_main(&args[1..]),
         Some("view") => view_main(&args[1..]),
         Some("kanban") => kanban_main(&args[1..]),
@@ -2603,6 +2668,7 @@ pub fn client_main(args: &[String]) -> i32 {
             );
             eprintln!("       foreman snapshot [--project P] [--terminal T]");
             eprintln!("       foreman focus [--project P] [--terminal T]");
+            eprintln!("       foreman reconnect <tN> [--project P]");
             eprintln!("       foreman icat <file.png> [--cols N]");
             eprintln!("       foreman view <file.png> [--project P]");
             eprintln!("       foreman kanban <action> ...");
@@ -2792,6 +2858,21 @@ fn focus_main(args: &[String]) -> i32 {
         }
     };
     report("foreman focus", request(&client_pipe(), &req))
+}
+
+fn reconnect_main(args: &[String]) -> i32 {
+    if let Some("--help" | "-h") = args.first().map(String::as_str) {
+        println!("{HELP_RECONNECT}");
+        return 0;
+    }
+    let req = match parse_reconnect_args(args, std::env::var("FOREMAN_PROJECT_ID").ok()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("foreman reconnect: {e}");
+            return 2;
+        }
+    };
+    report("foreman reconnect", request(&client_pipe(), &req))
 }
 
 fn view_main(args: &[String]) -> i32 {
@@ -3766,6 +3847,9 @@ mod tests {
         assert_eq!(client_main(&s(&["snapshot", "-h"])), 0);
         assert_eq!(client_main(&s(&["kanban", "--help"])), 0);
         assert_eq!(client_main(&s(&["kanban", "-h"])), 0);
+        assert_eq!(client_main(&s(&["reconnect", "--help"])), 0);
+        assert_eq!(client_main(&s(&["reconnect", "-h"])), 0);
+        assert_eq!(client_main(&s(&["reconnect"])), 2, "no terminal: bad arguments");
     }
 
     #[test]
@@ -4583,6 +4667,63 @@ mod tests {
                 .contains("not available to remote peers")
         );
         assert!(msg.is_none());
+    }
+
+    #[test]
+    fn reconnect_is_local_only() {
+        let (reply, msg) = remote_roundtrip(
+            &["127.0.0.1"],
+            "{\"cmd\":\"reconnect\",\"project\":\"p1\",\"terminal\":\"t2\"}\n",
+        );
+        assert!(
+            reply
+                .error
+                .unwrap()
+                .contains("not available to remote peers")
+        );
+        assert!(msg.is_none(), "nothing reached the GUI channel");
+    }
+
+    /// The new verb's wire shape; no existing request gained a field.
+    #[test]
+    fn reconnect_request_wire_shape() {
+        let req = parse_reconnect_args(&s(&["t4"]), Some("p2".into())).unwrap();
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"cmd":"reconnect","project":"p2","terminal":"t4"}"#
+        );
+        let req = parse_reconnect_args(&s(&["t4"]), None).unwrap();
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"cmd":"reconnect","terminal":"t4"}"#
+        );
+        let req = parse_reconnect_args(&s(&["--project", "p3", "t4"]), Some("p2".into())).unwrap();
+        assert_eq!(req.project.as_deref(), Some("p3"), "--project wins");
+        for bad in [&[][..], &["t4", "t5"], &["--now", "t4"], &["--project"]] {
+            assert!(parse_reconnect_args(&s(bad), None).is_err(), "{bad:?}");
+        }
+        // Existing verbs serialize exactly as before.
+        let focus = FocusRequest {
+            cmd: "focus".into(),
+            project: Some("p2".into()),
+            terminal: Some("t4".into()),
+        };
+        assert_eq!(
+            serde_json::to_string(&focus).unwrap(),
+            r#"{"cmd":"focus","project":"p2","terminal":"t4"}"#
+        );
+        let send = SendRequest {
+            cmd: "send".into(),
+            project: Some("p2".into()),
+            terminal: Some("t4".into()),
+            text: Some("hi".into()),
+            keys: vec![],
+            settle_ms: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&send).unwrap(),
+            r#"{"cmd":"send","project":"p2","terminal":"t4","text":"hi"}"#
+        );
     }
 
     #[test]

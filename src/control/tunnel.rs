@@ -1004,7 +1004,15 @@ mod tests {
         assert_eq!(route("POST", "/hook"), Ok(Route::Hook));
         assert_eq!(route("DELETE", "/chat").unwrap_err().status, 405);
         assert_eq!(route("GET", "/hook").unwrap_err().status, 405);
-        for path in ["/open", "/send", "/close", "/snapshot", "/kanban", "/"] {
+        for path in [
+            "/open",
+            "/send",
+            "/close",
+            "/snapshot",
+            "/kanban",
+            "/reconnect",
+            "/",
+        ] {
             assert_eq!(route("POST", path).unwrap_err().status, 404, "{path}");
             assert_eq!(route("GET", path).unwrap_err().status, 404, "{path}");
         }
@@ -1439,6 +1447,25 @@ mod tests {
                 "POST /send HTTP/1.1\r\nAuthorization: Bearer {tok}\r\nContent-Length: 0\r\n\r\n"
             ),
             "404",
+        );
+        // A Remote agent cannot reconnect a pane, by path or by verb.
+        refused(
+            format!(
+                "POST /reconnect HTTP/1.1\r\nAuthorization: Bearer {tok}\r\nContent-Length: 0\r\n\r\n"
+            ),
+            "404",
+        );
+        let verb = r#"{"cmd":"reconnect","project":"p1","terminal":"t1"}"#;
+        refused(
+            format!(
+                "POST /chat?cmd=reconnect HTTP/1.1\r\nAuthorization: Bearer {tok}\r\nContent-Length: {}\r\n\r\n{verb}",
+                verb.len()
+            ),
+            "200",
+        );
+        assert!(
+            seen.recv().unwrap().starts_with("chat "),
+            "a reconnect line posted to /chat is chat text, never a verb"
         );
         refused(
             format!(

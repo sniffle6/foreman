@@ -317,9 +317,10 @@ note typed at launch, with the values written out.
 A Remote Session's first launch joins the room at its end, so it gets no
 catch-up of earlier posts. A reconnect keeps its Member and cursor. A
 Claude launched with hooks also holds every post and typed note until a
-hook event says it is past the dialog: its brief's `UserPromptSubmit`, or
-`SessionStart` for a bare launch or `--continue`. Nothing opens the hold
-on a timer.
+hook event says it is past the dialog: its brief's `UserPromptSubmit` (one
+word or many, bare or by path), or for a bare launch, `--continue` and a
+slash command, a fixed settle after `SessionStart` so the REPL has mounted
+(Results, 2026-11-24). Nothing opens the hold before an event.
 
 Accepted risk: the token sits on a command line (base64, not secret) on
 both PCs, so another process running as the same user can read it, and on
@@ -492,6 +493,10 @@ Remote instead of listing a process tree it cannot see.
   `OpenReply::history`. Local callers only.
 - `status` marks Remote Sessions with the Remote's name, in text and
   `--json`.
+- `foreman reconnect tN` is a new request kind (`ReconnectRequest`) that
+  does what Enter on the disconnect bar does, and is refused for anything
+  but a disconnected Remote Session. Local pipe only: not a peer verb, and
+  the Tunnel has no route that builds it.
 - The dispatch and chat skills gain a short "another PC" section using
   `--on`; both are embedded, so the Codex twins and a rebuild go with it.
 
@@ -692,7 +697,62 @@ instance's local probe pane.
   installed; typed note, unverified) and **Windows Remotes** (none exist;
   typed note, unverified).
 
-## Order of work## Order of work
+## Results, 2026-11-24, the settle after SessionStart and `foreman reconnect`
+
+Release builds ran as their own instances (own `APPDATA`, agent environment
+stripped), driven through their pipes against the Debian Remote, Claude
+Code 2.1.331. Every run used a new `/tmp` directory. A post counts as
+delivered when the transcript holds it as a typed prompt or as a prompt
+queued while Claude was busy. BEFORE is main plus the new verb; AFTER adds
+the settle and `remote::hooked_claude`.
+
+- **R1** bare `claude`, a broadcast posted while the trust dialog shows,
+  the dialog answered with `send`. **R2** the same with `claude "<brief>"`.
+  **R3** a one-word brief. **R4** launched by path
+  (`/home/andy/.npm-global/bin/claude "<brief>"`). **R5** a bare Claude that
+  had posted once on its typed note, its `ssh.exe` stopped by PID, then
+  `foreman reconnect`, then asked in the room to post back.
+- **R1e / R5e**: R1 and R5 with a held post of 1150 emoji, 4.6 KB on one
+  line. For R5e it was posted while the Session was disconnected.
+
+| Run | BEFORE runs | lost | AFTER runs | lost |
+|---|---|---|---|---|
+| R1 | 10 | 0 | 20 | 0 |
+| R2 | 10 | 0 | 10 | 0 |
+| R3 | 10 | 0 | 20 | 0 |
+| R4 | 10 | 0 | 10 | 0 |
+| R5 | 10 | 0 | 20 | 0 |
+| R1e | 5 | 5 | 20 | 0 |
+| R5e | 5 | 1 | 10 | 0 |
+
+- **What was found.** The short loss the card described did not reproduce
+  through foreman: 50 of 50 held posts and notes arrived. In every R5 run
+  the fresh note arrived and the agent posted back on the new token. The
+  same emoji post sent to a mounted REPL arrived 3 of 3. So the loss is
+  timing plus length: a held line over 4095 bytes released at
+  `SessionStart` lands in the cooked tty before the REPL mounts, and Linux
+  drops it.
+- **Measured with a pty on the Remote, no foreman** (53 launches: bare,
+  one-word brief, multi-word brief, `--continue`). After the answer, the
+  dialog turned bracketed paste, focus reporting and `?2031` off about 0.2 s
+  before `SessionStart`. The REPL turned them back on 0.098-0.185 s after it
+  and painted its footer at 0.180-0.267 s. A short paste sent 0-700 ms after
+  `SessionStart` arrived 50 of 50. A 6000-byte one-line paste was lost at
+  +0 and arrived at +400 ms; 3000 bytes arrived at +0. Hence
+  `START_SETTLE` = 2 s, 7.5x the slowest paint. Bracketed paste is already
+  on at the dialog, so that mode is no signal of a mounted REPL.
+- **Slash briefs**: `/cost` and `/context` fired no `UserPromptSubmit`,
+  `/init` did. A slash brief therefore settles like a bare launch.
+- **Undercounted, then fixed**: six AFTER R3 runs first read as
+  lost. Their posts were in the transcript as `queued_command` attachments,
+  queued while Claude worked its brief. Every run in both tables was
+  recounted with both forms. Each input arrived exactly once, except
+  BEFORE R1e and R5e's losses.
+- **Not run**: Grok (not installed), Windows Remotes (none exist). The
+  leading-space slash brief (`"  /cost"`) was classified after the AFTER
+  build and is unit-tested only.
+
+## Order of work
 
 One run, in this order, each step usable when it lands:
 

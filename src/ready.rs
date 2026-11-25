@@ -109,9 +109,13 @@ pub struct ReadyGate {
     /// Nothing is pasted while set, Ready or not: a Remote Claude may still
     /// be at its folder-trust dialog, which reports no state and quits on
     /// any Enter. Set at spawn ([`Self::hold`]), cleared by the hook event
-    /// its [`crate::remote::ChatHold`] names ([`Self::release`]); never on a
-    /// timer, which would type into the dialog it waits out.
+    /// its [`crate::remote::ChatHold`] names ([`Self::release`]) or at a
+    /// deadline that event set ([`Self::release_at`]); never by a timer
+    /// alone, which would type into the dialog it waits out.
     held: bool,
+    /// When a held gate lets go by itself ([`Self::release_at`]); checked by
+    /// [`Self::poll`].
+    release_at: Option<Instant>,
 }
 
 impl ReadyGate {
@@ -124,17 +128,28 @@ impl ReadyGate {
             ink: InkScan::Ground,
             ready: false,
             held: false,
+            release_at: None,
         }
     }
 
     /// Paste nothing until [`Self::release`]. Queued input keeps its order.
     pub fn hold(&mut self) {
         self.held = true;
+        self.release_at = None;
     }
 
     /// Let held input go, oldest first, one paste per submit as always.
     pub fn release(&mut self) {
         self.held = false;
+        self.release_at = None;
+    }
+
+    /// Release at `at` unless something releases sooner. An earlier deadline
+    /// already set wins; a gate that is not held ignores this.
+    pub fn release_at(&mut self, at: Instant) {
+        if self.held {
+            self.release_at = Some(self.release_at.map_or(at, |t| t.min(at)));
+        }
     }
 
     /// Is input waiting for [`Self::release`]?
@@ -195,6 +210,9 @@ impl ReadyGate {
     /// Drain queued injects one turn at a time and fire a due deferred submit.
     /// Call every pump after rx/DSR updates with the same `now`.
     pub fn poll(&mut self, now: Instant) -> Vec<Action> {
+        if self.release_at.is_some_and(|t| now >= t) {
+            self.release();
+        }
         let mut out = Vec::new();
         if let Some(due) = self.pending_submit
             && now >= due
@@ -279,6 +297,74 @@ mod tests {
         );
         assert_eq!(gate.poll(t + SUBMIT_DELAY), [Action::Write(b"\r".to_vec())]);
         assert!(gate.chat_input_available());
+    }
+
+    /// A timed release (SessionStart's settle) lets go exactly at its
+    /// deadline: nothing before it, then every held input once, oldest
+    /// first, including input queued while it waited. An earlier deadline
+    /// wins, a later one never pushes it back, and a gate that is not held
+    /// ignores one.
+    #[test]
+    fn a_timed_release_keeps_order_and_loses_or_repeats_nothing() {
+        let now = Instant::now();
+        let at = |ms| now + Duration::from_millis(ms);
+        let mut gate = ReadyGate::new();
+        gate.on_dsr_reply_flushed(true);
+        gate.on_rx_chunk(b"X");
+        gate.release_at(at(10));
+        assert!(gate.try_inject("early", now).is_some(), "not held: ignored");
+        let _ = gate.poll(at(SUBMIT_DELAY.as_millis() as u64));
+        gate.hold();
+        assert!(gate.try_inject("note", at(1_000)).is_none());
+        assert!(gate.try_inject("post 1", at(1_000)).is_none());
+        gate.release_at(at(2_500));
+        gate.release_at(at(9_000)); // a second SessionStart: no later
+        assert!(gate.try_inject("post 2", at(2_000)).is_none());
+        for ms in [1_000, 2_000, 2_499] {
+            assert!(gate.poll(at(ms)).is_empty(), "held at {ms} ms");
+            assert!(!gate.chat_input_available());
+        }
+        let mut written = Vec::new();
+        let mut t = at(2_500);
+        for _ in 0..8 {
+            written.extend(gate.poll(t));
+            t += SUBMIT_DELAY;
+        }
+        let pasted = |s: &str| Action::Write(paste_wrap(s));
+        let enter = Action::Write(b"\r".to_vec());
+        assert_eq!(
+            written,
+            [
+                pasted("note"),
+                enter.clone(),
+                pasted("post 1"),
+                enter.clone(),
+                pasted("post 2"),
+                enter
+            ],
+            "each once, in order"
+        );
+        assert!(!gate.held() && gate.chat_input_available());
+
+        // An earlier deadline set later still wins.
+        let mut gate = ReadyGate::new();
+        gate.on_dsr_reply_flushed(true);
+        gate.on_rx_chunk(b"X");
+        gate.hold();
+        gate.release_at(at(5_000));
+        gate.release_at(at(3_000));
+        assert!(gate.try_inject("x", now).is_none());
+        assert!(gate.poll(at(2_999)).is_empty());
+        assert_eq!(gate.poll(at(3_000)), [pasted("x")]);
+        // Holding again clears any deadline left from before.
+        let mut gate = ReadyGate::new();
+        gate.on_dsr_reply_flushed(true);
+        gate.on_rx_chunk(b"X");
+        gate.hold();
+        gate.release_at(at(1));
+        gate.hold();
+        assert!(gate.try_inject("y", now).is_none());
+        assert!(gate.poll(at(60_000)).is_empty(), "the old deadline is gone");
     }
 
     #[test]

@@ -116,19 +116,26 @@ is for changing the feature.
   catch-up. A Claude launched with hooks holds every post and typed note
   (`remote::ChatHold`, `ReadyGate::hold`) until a hook event opens it: Claude
   runs no hook at the dialog (seen 2026-11-23: 40 s at the dialog, nothing,
-  then `SessionStart` 0.3 s after the answer). There is no timer. A timer
-  would type into the dialog it waited out.
-- **`SessionStart` is too early for a launch with a brief.** Claude's REPL is
-  still mounting when it fires. A post pasted then was lost once in three
-  tries: no `[chat …]` turn in the transcript. In the other two the tty
-  echoed it and the REPL read it later. So a launch whose brief rides in
-  argv waits for that brief's `UserPromptSubmit`, which only a mounted REPL
-  sends. A bare launch and `--continue` have nothing later, so `SessionStart`
-  opens theirs. A bare one kept its held post once; that is not proof it
-  cannot lose one.
+  then `SessionStart` 0.3 s after the answer). Nothing opens the hold before
+  an event: a timer alone would type into the dialog it waited out.
+- **`SessionStart` comes before the REPL can read a long line.** After the
+  dialog the tty is in cooked mode until the REPL mounts, and Linux drops a
+  line over 4095 bytes there. Seen 2026-11-24 (Claude Code 2.1.331): a held
+  post of 1150 emoji (4.6 KB on one line) released at `SessionStart` was
+  lost 5 times in 5, and the same post sent to a mounted REPL arrived 3 in 3.
+  Held across a reconnect (`claude --continue`) it was lost 1 in 5. Short input is buffered and read later, so 50 ordinary runs lost nothing.
+  So `SessionStart` opens a hold only `remote::START_SETTLE` (2 s) later.
+  Measured with a pty on the Remote over 53 launches, the REPL turned
+  bracketed paste back on 0.10-0.19 s after `SessionStart` and painted at
+  0.18-0.27 s. Any other event comes from a mounted REPL and opens it at
+  once. A launch whose first argument is a brief, one word or many, bare or
+  by path, waits for that brief's `UserPromptSubmit` instead
+  (`remote::hooked_claude`). A slash command may never send one (`/cost`
+  and `/context` did not, `/init` did), so it settles like a bare launch.
 - **A held Claude whose hooks never run holds forever.** Examples are
   `disableAllHooks` in the Remote's settings, a missing `curl`, a subcommand
-  (`claude mcp …`), or `--version`. Its posts stay in the room, its typed
+  (`claude mcp …`: a first argument counts as a brief, so it waits for a
+  `UserPromptSubmit` that never comes), or `--version`. Its posts stay in the room, its typed
   note stays queued, and `snapshot` shows nothing typed. Codex, Grok, a
   shell, a wrapper and a Windows Remote carry no hooks and get no hold.
 - **Codex in an untrusted Remote directory could not post.** Seen twice on
@@ -200,8 +207,10 @@ is for changing the feature.
 
 - **No auto-reconnect.** A dropped connection may have eaten a shell input,
   and an uncertain input must never be resent by itself. Reconnect is the
-  human's Enter on the disconnect bar, and the Dispatch prompt is never sent
-  again.
+  human's Enter on the disconnect bar, or `foreman reconnect tN`, which does
+  the same through this PC's pipe only: a peer and the Tunnel cannot send
+  it, so a Remote agent cannot reconnect a pane. The Dispatch prompt is never
+  sent again.
 - **The typed note writes URL and token out; the in-prompt one names
   `$FOREMAN_URL` and `$FOREMAN_TOKEN`.** The prompt is argv, which every user
   on the Remote can read. A typed note is not, and it also serves Grok and
@@ -223,6 +232,13 @@ is for changing the feature.
   It makes `/tmp/foreman-mkdir-test` and hostile names inside it, so that
   directory must not exist first. Remove it after:
   `ssh user@pc 'rm -rf -- /tmp/foreman-mkdir-test'`.
+
+- **Drive a reconnect** (tests, or Enter without the GUI). Find the
+  Session's `ssh.exe` by its parent, the foreman PID
+  (`Get-CimInstance Win32_Process -Filter "Name='ssh.exe' and ParentProcessId=<pid>"`),
+  stop that PID, wait for `disconnected: true` in `status --json`, then
+  `foreman reconnect tN --project pN`. It refuses a local Session and a
+  connected one.
 
 - **Check the Tunnel by hand.** In a Remote Session's shell (Posix):
   `curl -sS -H "Authorization: Bearer $FOREMAN_TOKEN" "$FOREMAN_URL/status"`.
