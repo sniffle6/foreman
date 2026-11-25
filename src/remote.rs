@@ -313,6 +313,25 @@ const AGENT_PACKAGES: &[(&str, &str)] = &[
 /// and may be a wrapper script that replays its brief.
 const PROGRAM_EXTENSIONS: &[&str] = &["exe", "cmd", "bat", "com", "ps1"];
 
+/// A wrapper [`program_agent`] knows the grammar of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrapper {
+    /// `npx`: runs the agent natively on the Remote, from an npm package.
+    Npx,
+    /// `wsl`: runs the agent inside a WSL distro on a Windows Remote, with
+    /// that distro's home and logins, not the Windows host's.
+    Wsl,
+}
+
+impl Wrapper {
+    pub fn name(self) -> &'static str {
+        match self {
+            Wrapper::Npx => "npx",
+            Wrapper::Wsl => "wsl",
+        }
+    }
+}
+
 /// The agent a Remote launch's PROGRAM is, from [`program_agent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgramAgent {
@@ -320,7 +339,7 @@ pub struct ProgramAgent {
     pub agent: &'static str,
     /// Run through `npx` or `wsl` ([`npx_agent`], [`wsl_agent`]) rather
     /// than by itself.
-    pub wrapped: bool,
+    pub via: Option<Wrapper>,
 }
 
 /// Which agent `argv`'s program is, exactly: its file stem is the agent's
@@ -339,28 +358,49 @@ pub struct ProgramAgent {
 /// A wrong yes pastes the note and an Enter into whatever it is; a wrong no
 /// only waits for a post to carry the note.
 pub fn program_agent(argv: &[String]) -> Option<ProgramAgent> {
+    program(argv).map(|(p, _)| p)
+}
+
+/// [`program_agent`], plus how many leading words of `argv` run the agent:
+/// 1 for the agent by itself, and for a wrapper its program, its own
+/// options and the agent's command (npx's package spec or bin, wsl's agent
+/// name), so everything after is the agent's arguments.
+fn program(argv: &[String]) -> Option<(ProgramAgent, usize)> {
     if install_of(argv).is_some() {
         return None;
     }
-    let (program, rest) = argv.split_first()?;
-    let stem = program_stem(program)?;
+    let (first, rest) = argv.split_first()?;
+    let stem = program_stem(first)?;
     if let Some(agent) = agent_named(stem) {
-        return Some(ProgramAgent {
-            agent,
-            wrapped: false,
-        });
+        return Some((ProgramAgent { agent, via: None }, 1));
     }
-    let agent = if stem.eq_ignore_ascii_case("npx") {
-        npx_agent(rest)?
+    let (wrapper, (agent, used)) = if stem.eq_ignore_ascii_case("npx") {
+        (Wrapper::Npx, npx_agent(rest)?)
     } else if stem.eq_ignore_ascii_case("wsl") {
-        wsl_agent(rest)?
+        (Wrapper::Wsl, wsl_agent(rest)?)
     } else {
         return None;
     };
-    Some(ProgramAgent {
-        agent,
-        wrapped: true,
-    })
+    Some((
+        ProgramAgent {
+            agent,
+            via: Some(wrapper),
+        },
+        1 + used,
+    ))
+}
+
+/// The words of `argv` that run its agent through a wrapper, with the
+/// wrapper's own options and no argument of the agent's
+/// (`npx -y @openai/codex@1.2 "x"` → `npx -y @openai/codex@1.2`,
+/// `wsl -d U -u me -- claude "x"` → `wsl -d U -u me -- claude`). `None` for
+/// an agent run by itself and anything [`program_agent`] refuses. What a
+/// reconnect builds on and what a saved workspace keeps.
+pub fn wrapper_command(argv: &[String]) -> Option<Vec<String>> {
+    match program(argv)? {
+        (ProgramAgent { via: Some(_), .. }, used) => Some(argv[..used].to_vec()),
+        _ => None,
+    }
 }
 
 /// `board::AGENTS`' entry for `word`, ignoring case.
@@ -405,7 +445,9 @@ fn program_stem(program: &str) -> Option<&str> {
 /// package from the real CLI (`npm view`, 2026-11-24: `claude` 0.1.2, "This
 /// is not the official Claude Code package"; `codex` 0.2.3, "Static site and
 /// code documentation generator"), so `npx codex` may download and run that.
-fn npx_agent(rest: &[String]) -> Option<&'static str> {
+/// Returns the agent and how many words of `rest` that took, through
+/// `<first>`.
+fn npx_agent(rest: &[String]) -> Option<(&'static str, usize)> {
     let mut package: Option<&str> = None;
     let mut i = 0;
     while let Some(a) = rest.get(i) {
@@ -428,10 +470,11 @@ fn npx_agent(rest: &[String]) -> Option<&'static str> {
         }
     }
     let first = rest.get(i)?;
-    match package {
+    let agent = match package {
         None => agent_package(first),
         Some(p) => agent_package(p).filter(|agent| first == agent),
-    }
+    }?;
+    Some((agent, i + 1))
 }
 
 /// The agent an npm package spec names: an exact [`AGENT_PACKAGES`] name,
@@ -461,7 +504,9 @@ fn agent_package(spec: &str) -> Option<&'static str> {
 /// [--|-e|--exec] <agent> ...`, where `<agent>` is the bare name. Any other
 /// argument (`--cd`, `--shell-type`, `--system`, `--distribution-id`, every
 /// management argument) refuses.
-fn wsl_agent(rest: &[String]) -> Option<&'static str> {
+/// Returns the agent and how many words of `rest` that took, through the
+/// agent's name.
+fn wsl_agent(rest: &[String]) -> Option<(&'static str, usize)> {
     let mut i = 0;
     loop {
         match rest.get(i)?.as_str() {
@@ -477,7 +522,7 @@ fn wsl_agent(rest: &[String]) -> Option<&'static str> {
             _ => break,
         }
     }
-    agent_named(rest.get(i)?)
+    Some((agent_named(rest.get(i)?)?, i + 1))
 }
 
 /// How a launch of `argv` on a `shell` Remote teaches its agent the reply
@@ -491,10 +536,13 @@ fn wsl_agent(rest: &[String]) -> Option<&'static str> {
 /// codex-cli 0.163.0's shell), and [`prompt_index`] names the prompt. A
 /// brief that starts with `/` is a slash command, whose arguments the note
 /// would become, so it is never carried. Anything else takes
-/// [`typed_route`].
+/// [`typed_route`], except an agent given no argument of its own (`claude`,
+/// and the same through a wrapper, `npx -y @openai/codex@1.2`, which a
+/// reconnect relaunches): like anything that is no agent, it gets the note
+/// with its first post. A wrapper's own words are not the agent's.
 pub fn note_route(argv: &[String], shell: RemoteShell) -> crate::control::tunnel::NoteGoes {
     use crate::control::tunnel::NoteGoes;
-    if argv.len() < 2 || program_agent(argv).is_none() {
+    if !program(argv).is_some_and(|(_, used)| argv.len() > used) {
         return NoteGoes::WithFirstPost;
     }
     let sees_env = shell == RemoteShell::Posix && matches!(argv[0].as_str(), "claude" | "codex");
@@ -632,6 +680,8 @@ pub struct Relaunch {
     /// The agent provider, when the original argv's program was one
     /// ([`program_agent`]).
     pub agent: Option<&'static str>,
+    /// The wrapper the agent runs through again, if it ran through one.
+    pub via: Option<Wrapper>,
     /// The argv reopens the agent's latest conversation (a resume entry).
     pub resumes: bool,
     /// The original argv was an install of this provider; the relaunch is a
@@ -647,20 +697,31 @@ pub struct Relaunch {
 /// [`reconnect_class`]. An agent run by itself (`claude`,
 /// `C:\bin\claude.exe`) gets the provider's resume arguments from
 /// [`RESUME`], or none at all. One run through a wrapper [`program_agent`]
-/// accepts (`npx -y @anthropic-ai/claude-code "do X"`, `wsl -d U -- claude
-/// …`) fails safe: the bare provider, fresh, with no argument from the
-/// original argv, since any of them may be the Dispatch prompt. A command
-/// naming no agent runs again as it was; one naming an agent that is not
-/// its program, and an install, come back as a shell.
+/// accepts runs through that wrapper again, with the wrapper's own options
+/// and no argument of the agent's, since any of them may be the Dispatch
+/// prompt ([`wrapper_command`]):
+/// - `wsl` resumes: the agent ran inside that distro as that user, in the
+///   directory wsl was started in, and its conversations live there, so
+///   `wsl -d U -u me -- claude --continue` reopens the same one. `wsl`
+///   reads its own options only before the command (`wsl ls -la`), so the
+///   resume arguments reach the agent.
+/// - `npx` starts fresh, its package and version kept: on the Debian
+///   Remote's npm 9.2.0 an option after the package reached npm
+///   (`npx --no @anthropic-ai/claude-code --version` printed npm's version),
+///   so `--continue` or `--last` may never reach the agent.
+///
+/// A command naming no agent runs again as it was; one naming an agent that
+/// is not its program, and an install, come back as a shell.
 pub fn relaunch(original: &[String]) -> Relaunch {
     let shell = |install, withheld| Relaunch {
         argv: Vec::new(),
         agent: None,
+        via: None,
         resumes: false,
         install,
         withheld,
     };
-    let ProgramAgent { agent, wrapped } = match reconnect_class(original) {
+    let ProgramAgent { agent, via } = match reconnect_class(original) {
         ReconnectClass::Install(provider) => return shell(Some(provider), false),
         ReconnectClass::Shell => return shell(None, true),
         ReconnectClass::Rerun => {
@@ -671,50 +732,75 @@ pub fn relaunch(original: &[String]) -> Relaunch {
         }
         ReconnectClass::Agent(p) => p,
     };
-    if wrapped {
-        return Relaunch {
-            argv: vec![agent.to_string()],
-            agent: Some(agent),
-            ..shell(None, false)
-        };
-    }
     let resume = RESUME
         .iter()
         .find(|(p, _)| *p == agent)
         .map_or(&[][..], |(_, args)| *args);
+    let (head, resume) = match via {
+        None => (vec![original[0].clone()], resume),
+        Some(w) => {
+            let head = wrapper_command(original).expect("an accepted wrapper form");
+            (head, if w == Wrapper::Npx { &[][..] } else { resume })
+        }
+    };
     Relaunch {
-        argv: std::iter::once(original[0].clone())
+        argv: head
+            .into_iter()
             .chain(resume.iter().map(|a| a.to_string()))
             .collect(),
         agent: Some(agent),
+        via,
         resumes: !resume.is_empty(),
         ..shell(None, false)
     }
 }
 
+/// A command as the reconnect banner shows it ([`display_command`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownCommand {
+    /// One line, with no control characters.
+    pub line: String,
+    /// False when an argument held a control character (a newline, a tab,
+    /// an escape): it is shown as U+FFFD, so the line does not run as the
+    /// original did, and the banner says so on its own row.
+    pub faithful: bool,
+}
+
 /// `argv` as one line the human can read and retype on a `shell` Remote:
 /// a word with nothing a shell treats specially stays bare, anything else is
-/// quoted for that shell. For the reconnect banner of a command that is not
-/// rerun.
-pub fn display_command(argv: &[String], shell: RemoteShell) -> String {
+/// quoted for that shell. On PowerShell a quoted first word is a string, not
+/// a command, so it takes the call operator (`& 'C:\Program Files\x.exe'`).
+/// A control character cannot be both shown and pasted, so it is shown as
+/// U+FFFD and the result is not [`ShownCommand::faithful`]. For the
+/// reconnect banner of a command that is not rerun.
+pub fn display_command(argv: &[String], shell: RemoteShell) -> ShownCommand {
     let plain = |a: &str| {
         !a.is_empty()
             && a.chars().all(|c| {
                 c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '=' | '+')
             })
     };
-    argv.iter()
-        .map(|a| {
-            if plain(a) {
-                a.clone()
+    let faithful = !argv.iter().any(|a| a.chars().any(char::is_control));
+    let words: Vec<String> = argv
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let a = crate::terminal::note_safe(a);
+            if plain(&a) {
+                a
             } else if shell == RemoteShell::Posix {
-                sh_quote(a)
+                sh_quote(&a)
+            } else if i == 0 {
+                format!("& {}", ps_quote(&a))
             } else {
-                ps_quote(a)
+                ps_quote(&a)
             }
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect();
+    ShownCommand {
+        line: words.join(" "),
+        faithful,
+    }
 }
 
 /// [`relaunch`]'s argv.
@@ -909,7 +995,7 @@ pub fn hooked_claude(argv: &[String], shell: RemoteShell) -> Option<ChatHold> {
     let rest = argv.get(1..)?;
     let itself = ProgramAgent {
         agent: "claude",
-        wrapped: false,
+        via: None,
     };
     if shell != RemoteShell::Posix
         || program_agent(argv) != Some(itself)
@@ -1331,39 +1417,132 @@ mod tests {
     }
 
     /// An agent run through a wrapper [`program_agent`] accepts relaunches
-    /// the bare provider: no word of the original argv survives, so the
-    /// prompt cannot ride along.
+    /// through that wrapper, its options kept and no argument of the
+    /// agent's: wsl resumes inside the same distro, npx starts the same
+    /// package and version fresh. The bar names the wrapper.
     #[test]
-    fn a_wrapped_agent_relaunches_bare_and_never_carries_the_prompt() {
+    fn a_wrapped_agent_relaunches_through_its_wrapper_without_the_prompt() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let prompt = "do X";
-        for (original, want) in [
-            (v(&["npx", "@anthropic-ai/claude-code", prompt]), "claude"),
-            (v(&["npx", "@openai/codex", prompt]), "codex"),
-            (v(&["npx.cmd", "@openai/codex", prompt]), "codex"),
+        let prompt = "do X now";
+        for (original, want, agent, resumes, verb) in [
             (
-                v(&["npx", "-y", "@anthropic-ai/claude-code", prompt]),
+                v(&["wsl", "-d", "Ubuntu", "-u", "me", "--", "claude", prompt]),
+                v(&[
+                    "wsl",
+                    "-d",
+                    "Ubuntu",
+                    "-u",
+                    "me",
+                    "--",
+                    "claude",
+                    "--continue",
+                ]),
                 "claude",
+                true,
+                "resume claude through wsl",
             ),
             (
-                v(&["wsl", "-d", "Ubuntu", "--", "claude", prompt]),
+                v(&["wsl", "claude", prompt]),
+                v(&["wsl", "claude", "--continue"]),
                 "claude",
+                true,
+                "resume claude through wsl",
             ),
-            (v(&["wsl", "claude", prompt]), "claude"),
-            (v(&["wsl", "--", "codex", prompt]), "codex"),
-            (v(&["wsl", "--", "grok", prompt]), "grok"),
-            // The prompt names another provider: the launched agent wins.
-            (v(&["wsl", "codex", "compare with claude"]), "codex"),
+            (
+                v(&[
+                    "wsl.exe",
+                    "--distribution",
+                    "U",
+                    "-e",
+                    "codex",
+                    prompt,
+                    "--model",
+                    "m",
+                ]),
+                v(&[
+                    "wsl.exe",
+                    "--distribution",
+                    "U",
+                    "-e",
+                    "codex",
+                    "resume",
+                    "--last",
+                ]),
+                "codex",
+                true,
+                "resume codex through wsl",
+            ),
+            (
+                v(&["wsl", "--", "grok", prompt]),
+                v(&["wsl", "--", "grok"]),
+                "grok",
+                false,
+                "start grok fresh through wsl",
+            ),
+            (
+                v(&["wsl", "codex", "compare with claude"]),
+                v(&["wsl", "codex", "resume", "--last"]),
+                "codex",
+                true,
+                "resume codex through wsl",
+            ),
+            (
+                v(&["npx", "-y", "@openai/codex@1.2", prompt]),
+                v(&["npx", "-y", "@openai/codex@1.2"]),
+                "codex",
+                false,
+                "start codex fresh through npx",
+            ),
+            (
+                v(&["npx", "@anthropic-ai/claude-code", prompt]),
+                v(&["npx", "@anthropic-ai/claude-code"]),
+                "claude",
+                false,
+                "start claude fresh through npx",
+            ),
+            (
+                v(&[
+                    "npx.cmd",
+                    "--yes",
+                    "--",
+                    "@anthropic-ai/claude-code@latest",
+                    prompt,
+                ]),
+                v(&["npx.cmd", "--yes", "--", "@anthropic-ai/claude-code@latest"]),
+                "claude",
+                false,
+                "start claude fresh through npx",
+            ),
+            (
+                v(&[
+                    "npx",
+                    "-p",
+                    "@openai/codex@0.172.0",
+                    "codex",
+                    "exec",
+                    prompt,
+                ]),
+                v(&["npx", "-p", "@openai/codex@0.172.0", "codex"]),
+                "codex",
+                false,
+                "start codex fresh through npx",
+            ),
         ] {
             let r = relaunch(&original);
-            assert_eq!(r.argv, [want], "{original:?}");
-            assert_eq!(r.agent, Some(want));
-            assert!(!r.resumes, "no clean resume entry: fresh");
+            assert_eq!(r.argv, want, "{original:?}");
+            assert_eq!(r.agent, Some(agent));
+            assert_eq!(r.resumes, resumes, "{original:?}");
+            assert!(r.via.is_some());
             assert!(
                 r.argv.iter().all(|a| !a.contains(prompt)),
                 "{original:?} -> {:?}",
                 r.argv
             );
+            // What a reconnect runs is itself an accepted form of the same
+            // agent, so a second reconnect does the same again.
+            assert_eq!(program_agent(&r.argv), program_agent(&original));
+            let bar = crate::terminal::disconnect_bar_text("desk", true, 255, &r);
+            assert!(bar.ends_with(&format!("Enter to {verb}")), "{bar}");
         }
     }
 
@@ -1377,16 +1556,17 @@ mod tests {
     fn a_reconnect_never_replays_a_command_naming_an_agent_it_cannot_vouch_for() {
         use ReconnectClass::{Agent, Rerun, Shell};
         let brief = "do the card now";
-        let own = |agent| {
+        let own = |agent| Agent(ProgramAgent { agent, via: None });
+        let npx = |agent| {
             Agent(ProgramAgent {
                 agent,
-                wrapped: false,
+                via: Some(Wrapper::Npx),
             })
         };
-        let via = |agent| {
+        let wsl = |agent| {
             Agent(ProgramAgent {
                 agent,
-                wrapped: true,
+                via: Some(Wrapper::Wsl),
             })
         };
         let bash_c = format!("claude \"{brief}\"");
@@ -1425,47 +1605,47 @@ mod tests {
             // provider, fresh.
             (
                 vec!["npx", "@anthropic-ai/claude-code", brief],
-                via("claude"),
+                npx("claude"),
             ),
             (
                 vec!["npx", "-y", "@anthropic-ai/claude-code", brief],
-                via("claude"),
+                npx("claude"),
             ),
             (
                 vec!["npx", "--yes", "@anthropic-ai/claude-code", brief],
-                via("claude"),
+                npx("claude"),
             ),
-            (vec!["npx", "@openai/codex", brief], via("codex")),
-            (vec!["npx", "@openai/codex@latest", brief], via("codex")),
+            (vec!["npx", "@openai/codex", brief], npx("codex")),
+            (vec!["npx", "@openai/codex@latest", brief], npx("codex")),
             (
                 vec!["npx", "-y", "@openai/codex@0.172.0", brief],
-                via("codex"),
+                npx("codex"),
             ),
             (
                 vec!["npx", "@openai/codex@1.0.0-beta.1", brief],
-                via("codex"),
+                npx("codex"),
             ),
-            (vec!["npx.cmd", "@openai/codex", brief], via("codex")),
-            (vec!["npx", "--", "@openai/codex", brief], via("codex")),
+            (vec!["npx.cmd", "@openai/codex", brief], npx("codex")),
+            (vec!["npx", "--", "@openai/codex", brief], npx("codex")),
             (
                 vec!["npx", "-y", "--", "@anthropic-ai/claude-code", brief],
-                via("claude"),
+                npx("claude"),
             ),
             (
                 vec!["npx", "-p", "@anthropic-ai/claude-code", "claude", brief],
-                via("claude"),
+                npx("claude"),
             ),
             (
                 vec!["npx", "--package", "@openai/codex", "codex", brief],
-                via("codex"),
+                npx("codex"),
             ),
             (
                 vec!["npx", "--package=@openai/codex@latest", "codex", brief],
-                via("codex"),
+                npx("codex"),
             ),
             (
                 vec!["npx", "-y", "-p", "@openai/codex", "--", "codex", brief],
-                via("codex"),
+                npx("codex"),
             ),
             // npx forms whose grammar foreman does not know, or that may run
             // something else: a shell.
@@ -1495,26 +1675,26 @@ mod tests {
             (vec!["npx", "cowsay", "hi"], Rerun),
             // wsl: `-d`/`--distribution`, `-u`/`--user`, then `--`,
             // `-e`/`--exec` or the command: the bare provider, fresh.
-            (vec!["wsl", "claude", brief], via("claude")),
-            (vec!["wsl", "codex", "compare with claude"], via("codex")),
-            (vec!["wsl", "--", "grok", brief], via("grok")),
+            (vec!["wsl", "claude", brief], wsl("claude")),
+            (vec!["wsl", "codex", "compare with claude"], wsl("codex")),
+            (vec!["wsl", "--", "grok", brief], wsl("grok")),
             (
                 vec!["wsl", "-d", "Ubuntu", "--", "claude", brief],
-                via("claude"),
+                wsl("claude"),
             ),
             (
                 vec!["wsl", "--distribution", "Ubuntu", "codex", brief],
-                via("codex"),
+                wsl("codex"),
             ),
             (
                 vec!["wsl", "-u", "andy", "-e", "codex", brief],
-                via("codex"),
+                wsl("codex"),
             ),
             (
                 vec!["wsl", "-d", "U", "--user", "a", "--exec", "claude"],
-                via("claude"),
+                wsl("claude"),
             ),
-            (vec!["wsl.exe", "--", "claude", brief], via("claude")),
+            (vec!["wsl.exe", "--", "claude", brief], wsl("claude")),
             (vec!["wsl", "--cd", "~", "claude", brief], Shell),
             (vec!["wsl", "--shell-type", "login", "claude", brief], Shell),
             (vec!["wsl", "--system", "claude"], Shell),
@@ -1561,9 +1741,24 @@ mod tests {
             );
             let want: Vec<String> = match class {
                 Agent(ProgramAgent {
+                    via: Some(Wrapper::Npx),
+                    ..
+                }) => wrapper_command(&original).unwrap(),
+                Agent(ProgramAgent {
                     agent,
-                    wrapped: true,
-                }) => argv(&[*agent]),
+                    via: Some(Wrapper::Wsl),
+                }) => {
+                    let resume = RESUME.iter().find(|(p, _)| p == agent);
+                    wrapper_command(&original)
+                        .unwrap()
+                        .into_iter()
+                        .chain(
+                            resume
+                                .into_iter()
+                                .flat_map(|(_, a)| a.iter().map(|w| w.to_string())),
+                        )
+                        .collect()
+                }
                 Agent(ProgramAgent { agent, .. }) => {
                     let resume = RESUME.iter().find(|(p, _)| p == agent);
                     std::iter::once(original[0].clone())
@@ -1580,14 +1775,23 @@ mod tests {
             assert_eq!(r.argv, want, "{words:?}");
             assert_eq!(
                 r.resumes,
-                r.argv.len() > 1 && r.agent.is_some(),
+                r.agent.is_some()
+                    && r.argv
+                        .iter()
+                        .any(|a| { RESUME.iter().any(|(_, args)| args.contains(&a.as_str())) }),
                 "{words:?}"
             );
             if *class != Rerun {
-                // No argument of the original runs again, only its program.
+                // No argument of the original runs again, only its program
+                // (with a wrapper's own options) and resume words.
+                let used = program(&original).map_or(1, |(_, n)| n);
+                let kept: Vec<&String> = r
+                    .argv
+                    .iter()
+                    .filter(|a| !RESUME.iter().any(|(_, args)| args.contains(&a.as_str())))
+                    .collect();
                 assert!(
-                    r.argv.iter().skip(1).all(|a| !original[1..].contains(a)
-                        || RESUME.iter().any(|(_, args)| args.contains(&a.as_str()))),
+                    kept.len() <= used && kept.iter().zip(&original).all(|(a, b)| *a == b),
                     "{words:?} -> {:?}",
                     r.argv
                 );
@@ -1617,29 +1821,76 @@ mod tests {
     }
 
     /// The banner's copy of a command that is not rerun retypes as the same
-    /// words on its Remote's shell.
+    /// words on its Remote's shell. On PowerShell a quoted program takes the
+    /// call operator, or pasting it prints a string. A control character is
+    /// shown as U+FFFD and the copy says it is not faithful.
     #[test]
     fn a_withheld_command_is_shown_quoted_to_retype() {
-        let a = argv(&[
+        let shown = |a: &[&str], shell| {
+            let s = display_command(&argv(a), shell);
+            (s.line, s.faithful)
+        };
+        let a = [
             "env",
             "FOO=1",
             "claude",
             "say \"hi\" it's $HOME",
             "--model",
             "x",
-        ]);
+        ];
         assert_eq!(
-            display_command(&a, RemoteShell::Posix),
-            r#"env FOO=1 claude 'say "hi" it'\''s $HOME' --model x"#
+            shown(&a, RemoteShell::Posix),
+            (
+                r#"env FOO=1 claude 'say "hi" it'\''s $HOME' --model x"#.into(),
+                true
+            )
         );
         assert_eq!(
-            display_command(&a, RemoteShell::Pwsh),
-            r#"env FOO=1 claude 'say "hi" it''s $HOME' --model x"#
+            shown(&a, RemoteShell::Pwsh),
+            (
+                r#"env FOO=1 claude 'say "hi" it''s $HOME' --model x"#.into(),
+                true
+            )
         );
         assert_eq!(
-            display_command(&argv(&["vi", ""]), RemoteShell::Posix),
-            "vi ''"
+            shown(&["vi", ""], RemoteShell::Posix),
+            ("vi ''".into(), true)
         );
+        // A program that needs quoting.
+        let spaced = [r"C:\Program Files\x\my-claude.cmd", "do it"];
+        for shell in [RemoteShell::Pwsh, RemoteShell::WindowsPowerShell] {
+            assert_eq!(
+                shown(&spaced, shell),
+                (r"& 'C:\Program Files\x\my-claude.cmd' 'do it'".into(), true)
+            );
+        }
+        assert_eq!(
+            shown(&["/opt/my tools/claude-wrap", "x"], RemoteShell::Posix),
+            ("'/opt/my tools/claude-wrap' x".into(), true),
+            "sh runs a quoted program as it is"
+        );
+        // Only the first word: a quoted argument stays a plain string.
+        assert_eq!(
+            shown(&["nice", "it's"], RemoteShell::Pwsh),
+            ("nice 'it''s'".into(), true)
+        );
+        // Control characters: shown, never sent to the emulator, and flagged.
+        for (words, line) in [
+            (
+                &["env", "X=1", "claude", "line one\nline two"][..],
+                "env X=1 claude 'line one\u{FFFD}line two'",
+            ),
+            (&["nice", "claude", "a\tb"], "nice claude 'a\u{FFFD}b'"),
+            (
+                &["nice", "claude", "\x1b[2Jboom"],
+                "nice claude '\u{FFFD}[2Jboom'",
+            ),
+        ] {
+            let s = display_command(&argv(words), RemoteShell::Posix);
+            assert_eq!(s.line, line, "{words:?}");
+            assert!(!s.faithful, "{words:?}");
+            assert!(!s.line.chars().any(char::is_control));
+        }
     }
 
     fn remote(shell: RemoteShell) -> Remote {
@@ -2006,11 +2257,8 @@ mod tests {
     #[test]
     fn a_reconnected_claude_gets_the_hooks_again_with_the_new_token() {
         let r = remote(RemoteShell::Posix);
-        // The bare program resumes; a wrapper relaunches as bare `claude`.
-        for original in [
-            argv(&["claude", "do the card"]),
-            argv(&["npx", "@anthropic-ai/claude-code", "do the card"]),
-        ] {
+        // The bare program resumes.
+        for original in [argv(&["claude", "do the card"])] {
             let re = relaunch(&original);
             assert_eq!(re.agent, Some("claude"), "{original:?}");
             let mut l = launch(&r, "", &re.argv);
@@ -2030,8 +2278,11 @@ mod tests {
             assert!(s.contains("export FOREMAN_TOKEN='fresh-token'\n"), "{s}");
             assert!(!hooked[2].contains("fresh-token") && !hooked[2].contains("tok"));
         }
-        // A non-agent command relaunches as it was, and an install as a shell.
+        // A non-agent command relaunches as it was, and an install as a
+        // shell. An npx Claude relaunches through npx, as hookless as its
+        // first launch.
         for original in [
+            argv(&["npx", "@anthropic-ai/claude-code", "do the card"]),
             argv(&["htop"]),
             install_argv(
                 RemoteShell::Posix,

@@ -190,8 +190,12 @@ is for changing the feature.
   one would download is unproved.
 - **A reconnect never replays an agent's original prompt.** `remote::reconnect_class`
   has three classes. An agent program resumes (`claude --continue`,
-  `codex resume --last`), and through `npx`/`wsl` it starts the bare
-  provider fresh. A command that names no agent (`vi notes.md`, `htop`, a
+  `codex resume --last`). Through a wrapper it runs through that wrapper
+  again, its options kept and the agent's arguments dropped
+  (`remote::wrapper_command`): `wsl -d U -u me -- claude --continue` resumes
+  inside the distro, while npx starts the same package and version fresh,
+  since npm 9.2.0 took an option after the package as its own (below).
+  A command that names no agent (`vi notes.md`, `htop`, a
   shell) reruns as it was. A command that names one but is no agent program
   (`env X=1 codex "brief"`, `nice claude "brief"`, `bash -c 'claude …'`, and
   also `vi codex.md`) gets a login shell in the same directory and runs
@@ -201,13 +205,38 @@ is for changing the feature.
   shell". The banner's header is one row like every note, and the command
   follows it whole, quoted to retype (`Session::inject_note_full`): a note
   is elided to one row, and that cut the command mid-brief (2026-11-24).
-- **That shell gets none of the dead connection's queued chat.** A shell
-  would run it as commands, so `wm.rs` `reconnect` drops it.
+- **That shell leaves the room for good** (`ChatRoom::leave`): no Tunnel,
+  no reply note, none of the dead connection's queue, no later post, and
+  every later reconnect of the pane keeps it out (`has_left`). A post
+  addressed to it fails as to any exited Member. Before this, `rejoin` put
+  it back with its cursor, and a broadcast made while it was down ran in
+  bash, with the note's curl and its token after it (2026-11-25,
+  `echo CHATRAN > chat-ran.txt`). The banner's last row says chat stopped.
+- **foreman cannot see an agent behind an alias, a variable, a wrapper
+  script or a provider it does not know**, so such a command (`cc "brief"`,
+  `$AGENT "brief"`, `./run-claude.sh "brief"`) reconnects by rerunning it,
+  arguments and all. A user-written `claude.bat`/`.cmd`/`.ps1` that embeds a
+  brief is taken for the agent itself and resumes as one.
+- **Known limit: a pane that is no agent still gets typed chat.** Seen
+  2026-11-25: `open --on R -- bash` ran a broadcast's lines and the note's
+  curl; `open --on R -- vi notes.md` took the post and note as text, and
+  again after its reconnect reran vi; a local `open -- pwsh` got the post
+  and its catch-up typed, and ran nothing only because PowerShell refused to
+  parse the `[chat pN #M]` frame. A shell opened from the launcher is not a
+  Member (code, not run live). Whether non-agent panes should be in the
+  room is a decision nobody has made yet.
+- **"needs login" is the Windows host's.** An agent run through `wsl` lives
+  in the distro, with its own login, so it clears nothing
+  (`remote_install::agent_opened`); one through npx clears it.
 - **A workspace saved before `program` restores every Remote pane as a
   shell.** The old `agent` field came from the icon's scan, so a saved
   `vi codex.md` and a real Codex look the same; neither is trusted
   (`ContentSnap::Terminal`). Builds still write `agent` too, so an older
-  build restores a newer file's agents.
+  build restores a newer file's agents. A wrapped agent also saves
+  `wrapper`, the npx/wsl command without the agent's arguments; an older
+  build ignores it and restores the bare agent natively. Restore trusts a
+  `wrapper` only if it is exactly one for that `program`, and otherwise
+  opens a shell rather than the bare agent on the host.
 - **Typed input at Ready can answer Codex's update prompt.** Seen
   2026-11-24: a reconnect's `codex resume --last` showed "update available"
   and the carried posts' paste and Enter picked its default. Codex ran

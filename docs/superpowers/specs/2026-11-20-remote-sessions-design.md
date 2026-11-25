@@ -489,15 +489,18 @@ the ssh error can be copied. A fresh Enter (not key repeat) or a click on
 the bar relaunches the same Remote and directory; the tab title and the
 Sessions-panel row read "disconnected" until then. An agent Session
 relaunches with that provider's resume argv from one small table; a
-provider with no entry, or an agent launched through `npx` or `wsl`,
-starts the bare provider fresh. "Is an agent" is the program itself
+provider with no entry starts fresh. One launched through `npx` or `wsl`
+runs through it again with its own options and none of the agent's
+arguments: `wsl` resumes inside the distro, `npx` starts the same package
+fresh (`remote::wrapper_command`). "Is an agent" is the program itself
 (`remote::program_agent`), not the tab icon's scan. A reconnect never
 replays an agent's original prompt: a command that names no agent runs
 again as it was, and one that names an agent but is no agent program
 (`env X=1 codex "brief"`, `vi codex.md`) gets a login shell in its
 directory, since a brief and a file name look the same
 (`remote::reconnect_class`). The bar says "Enter to reconnect to a shell"
-and the banner prints the command.
+and the banner prints the command. That shell leaves the chat room for
+good: no Tunnel, no note, no chat, and posts to it fail as exited.
 
 **Inert on a Remote Session:** file-path links (URLs still open), file
 drops and image paste (refused with a toast). The close confirm names the
@@ -979,6 +982,38 @@ was answered once by hand.
 - Cleanup: vi quit with `:q!`, nothing saved. Directories and transcripts
   removed. Instances stopped by PID, sandbox workspace restored, settings
   unchanged. The trust entries stay in the Remote's `~/.claude.json`.
+
+## Results, 2026-11-25, the shell a reconnect opens leaves the room
+
+Same setup. BEFORE is 9c687a7; AFTER is this change. Claude sat at its
+trust dialog (never answered); its `ssh.exe` was stopped by PID, a
+broadcast was posted from the probe pane while it was down, then
+`foreman reconnect`.
+
+| Run | BEFORE | AFTER |
+|---|---|---|
+| `env FOO=1 claude "<brief>"`, broadcast `x⏎echo CHATRAN > chat-ran.txt` while down, reconnected | bash ran it: `chat-ran.txt` = `CHATRAN`; the note's curl ran with the token (`unknown member tN`) | nothing typed, no file; banner ends "(chat to this pane has stopped: it left the room)" |
+| `chat --to t3` / `@t3` after the reconnect | delivered and ran (`mention-ran.txt`) | `foreman chat: t3 has exited`, exit 1 |
+| a later broadcast | ran there too (`item2-ran.txt`) | nothing typed |
+| `status` for t3 | `chat` | `-`, `"chat":false`; no `-R` on its ssh; `FOREMAN_TOKEN` and `FOREMAN_URL` unset in the shell |
+
+Non-agent panes, BEFORE build (this change leaves them as they are):
+
+- `open --on falador -- bash`: a broadcast's `echo` and the note's curl ran.
+- `open --on falador -- vi notes.md`: the post and the note with its token
+  were pasted into the buffer. After a reconnect (ssh stopped, swap file
+  removed) vi reran, rejoined, and the next broadcast landed the same way,
+  with a fresh token.
+- a local `open -- pwsh -NoProfile`: its catch-up and the broadcast were
+  typed; PowerShell refused to parse the `[chat pN #M]` frame
+  (`Missing ] at end of attribute`), so nothing ran.
+- A launcher-opened Remote shell is not a Member (code, not run).
+
+Wrapper relaunch (wsl, npx) and the `wsl` "needs login" rule: unit tests
+only, no live wsl or npx run. Cleanup: vi quit with `:q!`; Remote
+directories removed; instances stopped by PID; sandbox workspace restored,
+settings unchanged. Claude never passed its dialog, so no transcript or
+trust entry was written.
 
 ## Order of work
 

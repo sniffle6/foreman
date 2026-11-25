@@ -153,15 +153,17 @@ impl IconKind {
 
     /// Map a dispatched program's argv to an agent icon, if recognized. Scans
     /// every token (so `npx @anthropic-ai/claude-code` and a bare `claude` both
-    /// hit) for a `claude`/`codex`/`grok` substring. Reconnect and the
-    /// workspace snapshot run and save whatever this returns, so the provider
-    /// is the one that launches, not the one a prompt mentions: a program
-    /// whose file stem IS a provider wins (`C:\claude code\bin\codex.exe` is
+    /// hit) for a `claude`/`codex`/`grok` substring. It draws the icon and
+    /// decides nothing that runs or is typed: reconnect and the workspace
+    /// snapshot go through `remote::program_agent`, and
+    /// `remote::reconnect_class` asks this only whether an agent is named
+    /// at all. The provider shown is the one that launches, not the one a
+    /// prompt mentions: a program whose file stem IS a provider wins (`C:\claude code\bin\codex.exe` is
     /// Codex), then the earliest mention in argv order (`wsl codex "compare
     /// with claude"` is Codex). An install Session's argv
     /// ([`crate::remote::install_of`]) is never an agent, though two of the
     /// vendor URLs name one: it is a shell running a third-party script, and
-    /// the icon, badges, status and the workspace snapshot all key off this.
+    /// the icon, badges and status key off this.
     pub fn from_argv(argv: &[String]) -> Option<Self> {
         if crate::remote::install_of(argv).is_some() {
             return None;

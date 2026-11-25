@@ -59,10 +59,15 @@ pub fn clear_ended(target: &str, provider: &str) {
 
 /// A Remote Session launched with `argv` opened on `target`: when its
 /// program is an agent ([`crate::remote::program_agent`], an accepted
-/// `npx`/`wsl` form included), that provider's "needs login" is over. A
-/// command that only names one (`vi codex.md`) clears nothing.
+/// `npx` form included), that provider's "needs login" is over. A
+/// command that only names one (`vi codex.md`) clears nothing, and neither
+/// does an agent run through `wsl`: it runs inside a distro, with that
+/// distro's home and login, while the mark is for the agent the install put
+/// on the Windows host itself.
 pub fn agent_opened(target: &str, argv: &[String]) {
-    if let Some(p) = crate::remote::program_agent(argv) {
+    if let Some(p) = crate::remote::program_agent(argv)
+        && p.via != Some(crate::remote::Wrapper::Wsl)
+    {
         clear_ended(target, p.agent);
     }
 }
@@ -1188,8 +1193,8 @@ mod tests {
         assert_eq!(marks_generation(), g, "nothing to clear, nothing moved");
     }
 
-    /// An agent opened through a wrapper foreman accepts ends "needs
-    /// login"; a command that only names the agent does not.
+    /// An agent opened by itself or through npx ends "needs login"; one run
+    /// inside WSL, and a command that only names the agent, do not.
     #[test]
     fn an_agent_opened_through_an_accepted_wrapper_clears_needs_login() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -1205,11 +1210,13 @@ mod tests {
                 "codex",
                 true,
             ),
+            // Inside a distro: not the host's install, so its mark stays.
             (
                 v(&["wsl", "-d", "Ubuntu", "--", "claude", "brief x"]),
                 "claude",
-                true,
+                false,
             ),
+            (v(&["wsl", "codex", "brief x"]), "codex", false),
             (v(&["claude", "brief x"]), "claude", true),
             (v(&["vi", "codex.md"]), "codex", false),
             (v(&["env", "X=1", "claude", "brief x"]), "claude", false),

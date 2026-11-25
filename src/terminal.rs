@@ -675,13 +675,51 @@ pub fn disconnect_bar_text(
     // A command that names an agent foreman cannot vouch for comes back as a
     // shell, and the bar says so before Enter: the human expected it rerun.
     let to = if next.withheld { " to a shell" } else { "" };
+    // An agent that ran through npx or wsl runs through it again, and the
+    // bar names it: `wsl` especially, where the agent is not the host's.
+    let through = next
+        .via
+        .map(|w| format!(" through {}", w.name()))
+        .unwrap_or_default();
     let verb = match (next.agent, next.resumes, ran) {
-        (Some(a), true, _) => format!("resume {a}"),
-        (Some(a), false, _) => format!("start {a} fresh"),
+        (Some(a), true, _) => format!("resume {a}{through}"),
+        (Some(a), false, _) => format!("start {a} fresh{through}"),
         (None, _, true) => format!("reconnect{to}"),
         (None, _, false) => format!("connect{to}"),
     };
     format!("{lead} — Enter to {verb}")
+}
+
+/// `text` with every control character (newline included) as U+FFFD, so
+/// text from an argv can never drive the emulator or break a row.
+pub fn note_safe(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
+/// A one-row note ([`Session::inject_note`]) as written to a `cols`-wide
+/// grid: control characters as U+FFFD ([`note_safe`]), so a banner carrying
+/// an argv (`dispatch_banner`, the reconnect banners) is inert text, and
+/// elided by display columns so it can never wrap.
+pub fn fit_note(note: &str, cols: usize) -> String {
+    // Fit by display columns, not chars: CJK chars in a task prompt
+    // occupy two cells each, and a char-count fit would still wrap.
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let note = note_safe(note);
+    if note.width() <= cols {
+        return note;
+    }
+    let budget = cols.saturating_sub(4);
+    let mut used = 0;
+    let head: String = note
+        .chars()
+        .take_while(|c| {
+            used += c.width().unwrap_or(0);
+            used <= budget
+        })
+        .collect();
+    format!("{head}… ──")
 }
 
 /// `text` as grid rows no wider than `cols` display columns, for
@@ -1268,13 +1306,14 @@ impl Session {
 
     /// A restored Remote Session: the Win and its disconnect bar, with no
     /// process and no connection until Enter. Restore must not open a batch
-    /// of SSH connections at launch, some to PCs that are off. `agent` is
-    /// the saved provider name (never a prompt), so Enter resumes it through
-    /// the one resume table and the tab keeps its icon; `dir` is the saved
+    /// of SSH connections at launch, some to PCs that are off. `argv` is
+    /// the saved provider, alone or as its wrapper command (never a prompt),
+    /// so Enter resumes it through [`crate::remote::relaunch`] and the tab
+    /// keeps its icon; empty for a shell. `dir` is the saved
     /// Remote directory (`None` = the Project's mapping decides at Enter).
     pub fn disconnected_remote(
         remote: &str,
-        agent: Option<&str>,
+        argv: Vec<String>,
         dir: Option<&str>,
         ctx: egui::Context,
     ) -> Session {
@@ -1292,7 +1331,7 @@ impl Session {
         session.exit = Some(0);
         // No exit to announce: it never ran.
         session.exit_noted = true;
-        session.dispatch_argv = Some(agent.map(|a| vec![a.to_string()]).unwrap_or_default());
+        session.dispatch_argv = Some(argv);
         session.remote = Some(remote.to_string());
         session.remote_dir = dir.map(str::to_string);
         session
@@ -2099,23 +2138,7 @@ impl Session {
         // so it can never wrap — a wrapped note reflows its head into
         // scrollback on the spawn-time shrink (see inject_note).
         if let Some(note) = self.pending_note.take() {
-            // Fit by display columns, not chars: CJK chars in a task prompt
-            // occupy two cells each, and a char-count fit would still wrap.
-            use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-            let fitted = if note.width() > cols {
-                let budget = cols.saturating_sub(4);
-                let mut used = 0;
-                let head: String = note
-                    .chars()
-                    .take_while(|c| {
-                        used += c.width().unwrap_or(0);
-                        used <= budget
-                    })
-                    .collect();
-                format!("{head}… ──")
-            } else {
-                note
-            };
+            let fitted = fit_note(&note, cols);
             let bytes = format!("\x1b[2m{fitted}\x1b[0m\r\n").into_bytes();
             self.parser.advance(&mut self.term, &bytes);
             self.content_gen = self.content_gen.wrapping_add(1);
@@ -7100,7 +7123,7 @@ mod tests {
     }
 
     fn watched_disconnected(ctx: &egui::Context) -> (Session, Arc<Mutex<Vec<u8>>>) {
-        let mut s = Session::disconnected_remote("desk", None, None, ctx.clone());
+        let mut s = Session::disconnected_remote("desk", Vec::new(), None, ctx.clone());
         let sent = Arc::new(Mutex::new(Vec::new()));
         s.writer = Box::new(SharedWriter(sent.clone()));
         (s, sent)
@@ -7625,6 +7648,19 @@ mod tests {
         );
     }
 
+    /// A one-row note is inert text that never wraps: an argv's escape, CR
+    /// or newline becomes U+FFFD before the elision.
+    #[test]
+    fn a_note_is_written_as_inert_text_fitted_to_the_width() {
+        assert_eq!(
+            fit_note("── dispatched: vi a\x1b[2Jb\r\n ──", 80),
+            "── dispatched: vi a\u{FFFD}[2Jb\u{FFFD}\u{FFFD} ──"
+        );
+        assert_eq!(fit_note("abcdefghij", 8), "abcd… ──");
+        assert_eq!(fit_note("ab\x07cdefghij", 8), "ab\u{FFFD}c… ──");
+        assert_eq!(note_safe("a\tb"), "a\u{FFFD}b");
+    }
+
     #[test]
     fn a_full_note_keeps_every_character_within_the_width() {
         assert_eq!(full_note_rows("abcdef", 4), ["abcd", "ef"]);
@@ -7675,7 +7711,11 @@ mod tests {
         );
         assert_eq!(
             text(true, 255, &v(&["npx", "@anthropic-ai/claude-code", "do X"])),
-            "Disconnected from desk — Enter to start claude fresh"
+            "Disconnected from desk — Enter to start claude fresh through npx"
+        );
+        assert_eq!(
+            text(true, 255, &v(&["wsl", "-d", "U", "--", "claude", "do X"])),
+            "Disconnected from desk — Enter to resume claude through wsl"
         );
         // A command naming an agent foreman cannot vouch for: a shell, said
         // before Enter.

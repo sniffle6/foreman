@@ -1092,6 +1092,9 @@ impl WindowManager {
                             shell: shell_to_str(s.shell).into(),
                             agent: program.clone(),
                             program,
+                            wrapper: on_remote
+                                .then(|| crate::remote::wrapper_command(s.dispatched()))
+                                .flatten(),
                             remote_dir: on_remote
                                 .then(|| s.remote_dir().map(str::to_string))
                                 .flatten(),
@@ -1360,6 +1363,7 @@ impl WindowManager {
                         shell,
                         remote,
                         program,
+                        wrapper,
                         remote_dir,
                         ..
                     } => {
@@ -1371,14 +1375,12 @@ impl WindowManager {
                         match found {
                             // Disconnected: no ssh until Enter.
                             Some(Ok(name)) => {
-                                // Only a known provider name: the file is
-                                // data, and this becomes the program Enter runs.
-                                let agent = program
-                                    .as_deref()
-                                    .filter(|a| crate::board::AGENTS.contains(a));
+                                // The file is data, and this becomes what
+                                // Enter runs ([`restored_program`]).
+                                let argv = restored_program(program.as_deref(), wrapper.as_deref());
                                 let mut s = Session::disconnected_remote(
                                     name,
-                                    agent,
+                                    argv,
                                     remote_dir.as_deref(),
                                     ctx.clone(),
                                 );
@@ -3228,7 +3230,7 @@ impl WindowManager {
         title: Option<&str>,
         ctx: &egui::Context,
     ) -> Result<WinId, String> {
-        let s = self.spawn_remote_session(argv, remote, dir, self.next, false, ctx)?;
+        let s = self.spawn_remote_session(argv, remote, dir, self.next, false, true, ctx)?;
         Ok(self.place_dispatched(
             s,
             argv,
@@ -3374,7 +3376,7 @@ impl WindowManager {
             What::Shell => Vec::new(),
         };
         let id = self.next;
-        let s = self.spawn_remote_session(&argv, remote, dir, id, false, ctx)?;
+        let s = self.spawn_remote_session(&argv, remote, dir, id, false, true, ctx)?;
         self.place_remote_win(s, format!("{}  ·  #{}", remote.name, id), place, ctx);
         Ok(id)
     }
@@ -3391,7 +3393,7 @@ impl WindowManager {
     ) -> Result<WinId, String> {
         let argv = crate::remote_install::session_argv(remote, provider)?;
         let id = self.next;
-        let s = self.spawn_remote_session(&argv, remote, "", id, false, ctx)?;
+        let s = self.spawn_remote_session(&argv, remote, "", id, false, true, ctx)?;
         let title = format!("{} · install {provider}  ·  #{id}", remote.name);
         self.place_remote_win(s, title, crate::remote_dir_prompt::Place::Default, ctx);
         Ok(id)
@@ -3642,6 +3644,10 @@ impl WindowManager {
     /// A launch carrying Claude's hooks holds all chat input until the hook
     /// event its [`crate::remote::ChatHold`] names
     /// ([`Session::hold_chat_until_hook`]).
+    /// `in_room` false is a pane taken out of the room
+    /// ([`crate::chat::ChatRoom::leave`]): no Tunnel, so no reply note and no
+    /// token in its shell.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_remote_session(
         &self,
         argv: &[String],
@@ -3649,10 +3655,15 @@ impl WindowManager {
         dir: &str,
         id: WinId,
         resumed_agent: bool,
+        in_room: bool,
         ctx: &egui::Context,
     ) -> Result<Session, String> {
         let terminal_id = term_tag(id);
-        let lease = self.remote_lease(argv, remote, &terminal_id, ctx)?;
+        let lease = if in_room {
+            self.remote_lease(argv, remote, &terminal_id, ctx)?
+        } else {
+            None
+        };
         let built = crate::remote::build(&crate::remote::Launch {
             remote,
             dir,
@@ -3774,6 +3785,13 @@ impl WindowManager {
         };
         let re = crate::remote::relaunch(&original);
         let argv = re.argv;
+        // A shell opened in place of a command foreman could not vouch for
+        // is no agent Member: it leaves the room, now and on every later
+        // reconnect, and gets no Tunnel. A shell runs whatever chat types
+        // into it, and the reply note's first line is a curl with the token
+        // (seen 2026-11-25: a broadcast's `echo` and the note's curl ran).
+        let tag = term_tag(id);
+        let left = re.withheld || self.chat.borrow().has_left(&tag);
         // A restored Session that never connected says "connecting", as its
         // bar said "Enter to connect".
         let ran = s.ever_connected();
@@ -3784,7 +3802,7 @@ impl WindowManager {
         // nothing proves Claude is past its dialog, and a shell would run it.
         // Any other agent has it typed at Ready (`remote::typed_route`).
         let mut fresh =
-            self.spawn_remote_session(&argv, &remote, &dir, id, re.agent.is_some(), ctx)?;
+            self.spawn_remote_session(&argv, &remote, &dir, id, re.agent.is_some(), !left, ctx)?;
         fresh.set_term_id(id);
         let withheld = re.withheld.then_some(&original[..]);
         let (banner, command) = reconnect_banner(&remote.name, remote.shell, &argv, withheld, ran);
@@ -3805,18 +3823,22 @@ impl WindowManager {
         };
         // Chat input the dead connection never wrote goes to the fresh one,
         // after the fresh note or carrying it, never ahead of it: the dead
-        // token would answer it with a 401. A shell opened in place of a
-        // command that was not rerun gets none: it would run chat as commands.
+        // token would answer it with a 401. A pane that left the room gets
+        // none: its shell would run chat as commands.
         if let Content::Terminal(old) = &mut t.content {
             let carried = old.take_pending_injects();
-            if withheld.is_none() {
+            if !left {
                 fresh.carry_injects(carried);
             }
         }
         // The dead Session drops here, and its job with it.
         t.content = Content::Terminal(fresh);
         let name = display_name(&t.title).to_string();
-        self.chat.borrow_mut().rejoin(&term_tag(id), &name);
+        if left {
+            self.chat.borrow_mut().leave(&tag);
+        } else {
+            self.chat.borrow_mut().rejoin(&tag, &name);
+        }
         Ok(())
     }
 
@@ -11036,13 +11058,37 @@ enum CatchUp {
 /// One dim line injected into a dispatched terminal at spawn, so the pane is
 /// never blank while a silent worker (`claude -p`) runs. Truncated so a long
 /// task prompt can't flood the pane.
+/// The logical argv a restored Remote tab reconnects from, out of its saved
+/// `program` and `wrapper`: the bare provider, or the wrapper command when
+/// it is exactly one [`crate::remote::wrapper_command`] gives for that
+/// provider, and otherwise nothing, a shell. A `wrapper` that fails that
+/// check would run the agent somewhere it never ran (the host instead of a
+/// WSL distro), so it is never dropped down to the bare provider.
+fn restored_program(program: Option<&str>, wrapper: Option<&[String]>) -> Vec<String> {
+    let Some(agent) = program.filter(|a| crate::board::AGENTS.contains(a)) else {
+        return Vec::new();
+    };
+    match wrapper {
+        None => vec![agent.to_string()],
+        Some(w) => {
+            let exact = crate::remote::wrapper_command(w).as_deref() == Some(w)
+                && crate::remote::program_agent(w).map(|p| p.agent) == Some(agent);
+            if exact { w.to_vec() } else { Vec::new() }
+        }
+    }
+}
+
 /// The pane note a reconnect opens with: where, and what it runs. Written
 /// as in progress: it lands before ssh has connected, and with the PC off
 /// the next line is ssh's error. `ran` = this Session had a connection; a
 /// restored one that never connected is "connecting", not "reconnecting".
 /// A `withheld` command ([`crate::remote::ReconnectClass::Shell`]) comes back
 /// as the second value, whole and quoted to retype
-/// ([`Session::inject_note_full`]): the human decides whether it runs.
+/// ([`Session::inject_note_full`]): the human decides whether it runs. The
+/// rows after the command say that chat to the pane has stopped (it left
+/// the room) and, when an argument held a control character, that the line
+/// does not run as the original did. Every note is written as inert text
+/// ([`crate::terminal::fit_note`]), so an argv cannot drive the emulator.
 fn reconnect_banner(
     remote: &str,
     shell: crate::remote::RemoteShell,
@@ -11052,9 +11098,18 @@ fn reconnect_banner(
 ) -> (String, Option<String>) {
     let verb = if ran { "reconnecting" } else { "connecting" };
     if let Some(original) = withheld {
+        let shown = crate::remote::display_command(original, shell);
+        let mut full = shown.line;
+        if !shown.faithful {
+            full.push_str(
+                "\n(an argument held a control character, shown as \u{FFFD}: \
+                 this line does not run as the original did)",
+            );
+        }
+        full.push_str("\n(chat to this pane has stopped: it left the room)");
         (
             format!("── {verb} to {remote}: a shell. Not rerun, as it may repeat a brief: ──"),
-            Some(crate::remote::display_command(original, shell)),
+            Some(full),
         )
     } else if argv.is_empty() {
         (format!("── {verb} to {remote}… ──"), None)
@@ -11952,6 +12007,7 @@ mod tests {
                                             remote: None,
                                             agent: None,
                                             program: None,
+                                            wrapper: None,
                                             remote_dir: None,
                                         },
                                     }],
@@ -12544,7 +12600,8 @@ mod tests {
         let pid = push(&mut wm, "proj");
         let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
         let child = wm.project_child_mut(pid).unwrap();
-        let dead = crate::terminal::Session::disconnected_remote("desk", None, None, ctx.clone());
+        let dead =
+            crate::terminal::Session::disconnected_remote("desk", Vec::new(), None, ctx.clone());
         child.push_win(
             7,
             Tab::fixed(
@@ -12985,7 +13042,7 @@ mod tests {
         for (id, remote, connected) in [(7, false, false), (8, true, true), (9, true, false)] {
             let mut s = crate::terminal::Session::disconnected_remote(
                 "gone",
-                None,
+                Vec::new(),
                 Some("/tmp"),
                 ctx.clone(),
             );
@@ -13047,7 +13104,7 @@ mod tests {
         for (id, remote) in [(7, true), (8, true), (9, false)] {
             let mut s = crate::terminal::Session::disconnected_remote(
                 "desk",
-                Some("claude"),
+                vec!["claude".to_string()],
                 Some("/tmp"),
                 ctx.clone(),
             );
@@ -13587,6 +13644,225 @@ mod tests {
         assert!(waits, "the first chat delivery carries it");
     }
 
+    /// A command naming an agent foreman cannot vouch for reconnects as a
+    /// shell, and that pane is no agent Member any more: it leaves the room
+    /// (one Exited line, no Joined), gets no Tunnel, no reply note and none
+    /// of the dead connection's queue, the room hands it nothing even when
+    /// it is ready, a post addressed to it is refused as to any exited
+    /// Member, and it saves as a plain Remote shell. A later reconnect keeps
+    /// it out. Seen live before this (2026-11-25): a broadcast's `echo` and
+    /// the note's curl ran in that shell.
+    #[test]
+    fn a_shell_class_reconnect_leaves_the_room_with_no_tunnel_note_or_chat() {
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        crate::control::tunnel::install(&ctx, tx, std::sync::mpsc::sync_channel(1).0);
+        let (_, tid) = wm
+            .open_dispatch(
+                open_on(
+                    "desk",
+                    Some("/tmp"),
+                    &["env", "FOO=1", "claude", "do the card"],
+                ),
+                &ctx,
+            )
+            .expect("ssh spawns");
+        let tag = term_tag(tid);
+        let child = wm.project_child_mut(pid).unwrap();
+        assert!(
+            child
+                .terminal_session(tid)
+                .unwrap()
+                .tunnel_token()
+                .is_some()
+        );
+        let s = child.terminal_session_mut(tid).unwrap();
+        s.inject_chat("[chat p1 #9] t1: queued on the dead connection");
+        s.kill_for_test();
+        child.chat_tick(false);
+        assert!(crew_exited(child, tid), "the room saw it go");
+        child
+            .chat
+            .borrow_mut()
+            .post("you", "echo CHATRAN > chat-ran.txt", &[], None)
+            .expect("a broadcast while it is down");
+        let reconnect = |wm: &mut WindowManager| {
+            let child = wm.project_child_mut(pid).unwrap();
+            let s = child.terminal_session_mut(tid).unwrap();
+            s.kill_for_test();
+            s.request_reconnect_for_test();
+            wm.refresh_reconnects(&ctx);
+        };
+        let check = |wm: &mut WindowManager| {
+            let child = wm.project_child_mut(pid).unwrap();
+            let s = child.terminal_session(tid).expect("the same pane");
+            assert!(!s.disconnected(), "reconnected");
+            assert!(s.dispatched().is_empty(), "a login shell runs nothing");
+            assert_eq!(s.tunnel_token(), None, "no Tunnel");
+            assert!(!s.reply_note_waits(), "no reply note");
+            assert!(s.pending_injects().is_empty(), "nothing carried");
+            assert!(crew_exited(child, tid), "it left the room");
+            assert!(child.chat.borrow().has_left(&tag));
+            assert!(!child.chat.borrow().is_member(&tag), "status: chat false");
+            let d = child.chat.borrow_mut().tick("p1", &[ready_member(tid)]);
+            assert!(d.iter().all(|x| x.id != tag), "the room hands it nothing");
+            let err = child
+                .chat
+                .borrow_mut()
+                .post("you", "run this", &[tag.clone()], None)
+                .expect_err("a post to it is refused");
+            assert_eq!(err, format!("{tag} has exited"));
+            match &child.capture_manager().windows[0].tabs[0].content {
+                crate::workspace::ContentSnap::Terminal {
+                    remote,
+                    agent,
+                    program,
+                    wrapper,
+                    ..
+                } => {
+                    assert_eq!(remote.as_deref(), Some("desk"));
+                    assert_eq!((agent, program, wrapper), (&None, &None, &None));
+                }
+                _ => panic!("expected a terminal"),
+            }
+            let room = child.chat.borrow();
+            let kinds: Vec<_> = room
+                .history_msgs()
+                .iter()
+                .filter(|m| m.from == tag)
+                .map(|m| m.kind)
+                .collect();
+            assert_eq!(
+                kinds,
+                [crate::chat::ChatKind::Joined, crate::chat::ChatKind::Exited],
+                "no Joined after the Exited"
+            );
+        };
+        reconnect(&mut wm);
+        check(&mut wm);
+        // The pane is a plain shell now: Rerun, and still out of the room.
+        reconnect(&mut wm);
+        check(&mut wm);
+    }
+
+    /// What a restored Remote tab reconnects from: the bare provider, its
+    /// exact wrapper command, or a shell. A wrapper that is not exactly one
+    /// for that provider never falls back to the bare agent, which would run
+    /// on the host instead of inside its WSL distro.
+    #[test]
+    fn a_restored_tab_rebuilds_its_wrapper_or_opens_a_shell() {
+        let w = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let wsl = w(&["wsl", "-d", "Ubuntu", "-u", "me", "--", "claude"]);
+        let npx = w(&["npx", "-y", "@openai/codex@1.2"]);
+        for (program, wrapper, want) in [
+            (Some("claude"), None, w(&["claude"])),
+            (Some("claude"), Some(wsl.clone()), wsl.clone()),
+            (Some("codex"), Some(npx.clone()), npx.clone()),
+            (None, None, Vec::new()),
+            (Some("vi"), None, Vec::new()),
+            // Not this provider's wrapper, or not a wrapper command at all.
+            (Some("codex"), Some(wsl.clone()), Vec::new()),
+            (
+                Some("claude"),
+                Some(w(&["wsl", "--", "claude", "the brief"])),
+                Vec::new(),
+            ),
+            (Some("claude"), Some(w(&["claude"])), Vec::new()),
+            (
+                Some("claude"),
+                Some(w(&["env", "X=1", "claude"])),
+                Vec::new(),
+            ),
+            (Some("codex"), Some(w(&["npx", "codex"])), Vec::new()),
+        ] {
+            assert_eq!(
+                restored_program(program, wrapper.as_deref()),
+                want,
+                "{program:?} {wrapper:?}"
+            );
+        }
+    }
+
+    /// A wrapped Remote agent saves its wrapper, restores with it, and its
+    /// Enter runs through the same wrapper: wsl resumes in its distro, npx
+    /// starts the same package fresh. It saves the same again.
+    #[test]
+    fn a_wrapped_remote_agent_round_trips_through_the_workspace() {
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let w = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (ran, saved, enter) in [
+            (
+                w(&[
+                    "wsl",
+                    "-d",
+                    "Ubuntu",
+                    "-u",
+                    "me",
+                    "--",
+                    "claude",
+                    "the brief",
+                ]),
+                w(&["wsl", "-d", "Ubuntu", "-u", "me", "--", "claude"]),
+                w(&[
+                    "wsl",
+                    "-d",
+                    "Ubuntu",
+                    "-u",
+                    "me",
+                    "--",
+                    "claude",
+                    "--continue",
+                ]),
+            ),
+            (
+                w(&["npx", "-y", "@openai/codex@1.2", "the brief"]),
+                w(&["npx", "-y", "@openai/codex@1.2"]),
+                w(&["npx", "-y", "@openai/codex@1.2"]),
+            ),
+        ] {
+            let mut wm = WindowManager::new();
+            wm.tag = Some("p1".into());
+            let mut s = Session::disconnected_remote("desk", Vec::new(), None, ctx.clone());
+            s.set_dispatched_for_test(ran.clone());
+            let (id, rect) = wm.next_slot(egui::vec2(580.0, 380.0));
+            s.set_term_id(id);
+            wm.push_win(id, Tab::fixed("agent", Content::Terminal(s)), rect);
+            let snap = wm.capture_manager();
+            match &snap.windows[0].tabs[0].content {
+                crate::workspace::ContentSnap::Terminal {
+                    program, wrapper, ..
+                } => {
+                    assert_eq!(
+                        program.as_deref(),
+                        crate::remote::program_agent(&ran).map(|p| p.agent)
+                    );
+                    assert_eq!(wrapper.as_ref(), Some(&saved), "{ran:?}");
+                }
+                _ => panic!("expected a terminal"),
+            }
+            let mut back = WindowManager::new();
+            back.tag = Some("p1".into());
+            back.apply_manager(&snap, &ctx);
+            let Content::Terminal(s) = &back.windows[0].tabs[0].content else {
+                panic!("expected a terminal");
+            };
+            assert_eq!(s.dispatched(), saved, "nothing of the brief");
+            assert_eq!(crate::remote::reconnect_argv(s.dispatched()), enter);
+            let json = |m: &crate::workspace::ManagerSnap| {
+                serde_json::to_string(&m.windows[0].tabs[0].content).unwrap()
+            };
+            assert_eq!(
+                json(&back.capture_manager()),
+                json(&snap),
+                "saves the same again"
+            );
+        }
+    }
+
     fn remote_terminal_snap(remote: &str) -> crate::workspace::ManagerSnap {
         remote_agent_snap(remote, None, None)
     }
@@ -13619,6 +13895,7 @@ mod tests {
                         remote: Some(remote.into()),
                         agent: agent.map(str::to_string),
                         program: program.map(str::to_string),
+                        wrapper: None,
                         remote_dir: dir.map(str::to_string),
                     },
                     ..Default::default()
@@ -13820,20 +14097,57 @@ mod tests {
             .map(String::from)
             .into();
         let head = "── reconnecting to desk: a shell. Not rerun, as it may repeat a brief: ──";
+        let stopped = "\n(chat to this pane has stopped: it left the room)";
         assert_eq!(
             reconnect_banner("desk", Posix, &[], Some(&original), true),
             (
                 head.to_string(),
-                Some(r"env FOO=1 claude 'post it'\''s done'".to_string())
+                Some(format!(r"env FOO=1 claude 'post it'\''s done'{stopped}"))
             )
         );
         assert_eq!(
             reconnect_banner("desk", Pwsh, &[], Some(&original), true),
             (
                 head.to_string(),
-                Some("env FOO=1 claude 'post it''s done'".to_string())
+                Some(format!("env FOO=1 claude 'post it''s done'{stopped}"))
             )
         );
+        // A quoted program on PowerShell takes the call operator.
+        let spaced: Vec<String> = [r"C:\Program Files\w\claude-wrap.cmd", "go now"]
+            .map(String::from)
+            .into();
+        let (_, full) = reconnect_banner("desk", Pwsh, &[], Some(&spaced), true);
+        assert!(
+            full.unwrap()
+                .starts_with(r"& 'C:\Program Files\w\claude-wrap.cmd' 'go now'")
+        );
+        // A control character: shown as U+FFFD, and its own row says the
+        // line does not run as the original did.
+        let multi: Vec<String> = ["env", "X=1", "claude", "one\ntwo"]
+            .map(String::from)
+            .into();
+        let (_, full) = reconnect_banner("desk", Posix, &[], Some(&multi), true);
+        assert_eq!(
+            crate::terminal::full_note_rows(&full.unwrap(), 200),
+            [
+                "env X=1 claude 'one\u{FFFD}two'",
+                "(an argument held a control character, shown as \u{FFFD}: \
+                 this line does not run as the original did)",
+                "(chat to this pane has stopped: it left the room)",
+            ]
+        );
+        // The one-row banners of a rerun and a resumed agent carry the argv
+        // too: written as inert text, never as escapes.
+        for argv in [
+            vec!["vi".to_string(), "a\x1b[2Jb\r\nc".to_string()],
+            vec!["claude".to_string(), "--continue\x07".to_string()],
+        ] {
+            let (note, none) = reconnect_banner("desk", Posix, &argv, None, true);
+            assert_eq!(none, None);
+            let written = crate::terminal::fit_note(&note, 200);
+            assert!(!written.chars().any(char::is_control), "{written:?}");
+            assert!(written.contains('\u{FFFD}'), "{written:?}");
+        }
     }
 
     #[test]
@@ -14031,7 +14345,8 @@ mod tests {
 
         let r = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(200.0, 200.0));
         let mut m = WindowManager::new();
-        let dead = crate::terminal::Session::disconnected_remote("desk", None, None, ctx.clone());
+        let dead =
+            crate::terminal::Session::disconnected_remote("desk", Vec::new(), None, ctx.clone());
         m.push_win(1, Tab::fixed("dead", Content::Terminal(dead)), r);
         assert!(groups_in_tab(&m.windows[0].tabs[0]).is_empty());
     }
@@ -16581,6 +16896,7 @@ mod tests {
                 remote: None,
                 agent: None,
                 program: None,
+                wrapper: None,
                 remote_dir: None,
             },
         };
@@ -16629,6 +16945,7 @@ mod tests {
                 remote: None,
                 agent: None,
                 program: None,
+                wrapper: None,
                 remote_dir: None,
             },
         };
@@ -16727,6 +17044,7 @@ mod tests {
                                 remote: None,
                                 agent: None,
                                 program: None,
+                                wrapper: None,
                                 remote_dir: None,
                             },
                         }],

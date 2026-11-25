@@ -139,6 +139,15 @@ pub enum ContentSnap {
         /// tab resumes through the one resume table. Remote only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         program: Option<String>,
+        /// The `npx` or `wsl` command `program` ran through, with the
+        /// wrapper's own options and never an argument of the agent's
+        /// ([`crate::remote::wrapper_command`]), so a restored tab resumes
+        /// inside the same WSL distro, or starts the same npx package, and
+        /// not the bare agent on the host. Absent for an agent run by
+        /// itself, so those files are unchanged. A build older than it
+        /// ignores it and restores the bare agent. Remote only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wrapper: Option<Vec<String>>,
         /// The directory on the Remote it ran in, so an explicit `--cwd`
         /// survives a restart. Absent = the Project's mapping. Remote only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -503,6 +512,7 @@ mod tests {
                                             remote: None,
                                             agent: None,
                                             program: None,
+                                            wrapper: None,
                                             remote_dir: None,
                                         },
                                     }],
@@ -580,6 +590,7 @@ mod tests {
             remote: remote.map(str::to_string),
             agent: None,
             program: None,
+            wrapper: None,
             remote_dir: None,
         };
         let json = serde_json::to_string(&terminal(Some("desk"))).unwrap();
@@ -600,12 +611,89 @@ mod tests {
                 remote,
                 agent,
                 program,
+                wrapper,
                 remote_dir,
             } => {
                 assert_eq!(shell, "powershell");
                 assert_eq!(remote, None);
-                assert_eq!((agent, program), (None, None));
+                assert_eq!((agent, program, wrapper), (None, None, None));
                 assert_eq!(remote_dir, None);
+            }
+            _ => panic!("expected Terminal"),
+        }
+    }
+
+    /// A wrapped agent saves its wrapper command; a bare one writes nothing
+    /// new (the next test pins its exact bytes). Both ways across builds: an
+    /// older build's reader, which has no `wrapper`, still reads a new file,
+    /// and an old file reads here with no wrapper.
+    #[test]
+    fn a_remote_agent_s_wrapper_round_trips_and_older_builds_read_it() {
+        let words = |a: &[&str]| a.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let wrapper = words(&["wsl", "-d", "Ubuntu", "-u", "me", "--", "claude"]);
+        let snap = ContentSnap::Terminal {
+            shell: "cmd".into(),
+            remote: Some("win".into()),
+            agent: Some("claude".into()),
+            program: Some("claude".into()),
+            wrapper: Some(wrapper.clone()),
+            remote_dir: None,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"Terminal","shell":"cmd","remote":"win","agent":"claude","program":"claude","wrapper":["wsl","-d","Ubuntu","-u","me","--","claude"]}"#
+        );
+        match serde_json::from_str(&json).unwrap() {
+            ContentSnap::Terminal {
+                program,
+                wrapper: w,
+                ..
+            } => {
+                assert_eq!(program.as_deref(), Some("claude"));
+                assert_eq!(w, Some(wrapper));
+            }
+            _ => panic!("expected Terminal"),
+        }
+        // The previous build's shape of this variant, field for field.
+        #[derive(Deserialize)]
+        #[serde(tag = "kind")]
+        enum OldContentSnap {
+            Terminal {
+                shell: String,
+                #[serde(default)]
+                remote: Option<String>,
+                #[serde(default)]
+                agent: Option<String>,
+                #[serde(default)]
+                program: Option<String>,
+                #[serde(default)]
+                remote_dir: Option<String>,
+            },
+        }
+        let OldContentSnap::Terminal {
+            shell,
+            remote,
+            agent,
+            program,
+            remote_dir,
+        } = serde_json::from_str(&json).expect("an older build reads a new file");
+        assert_eq!(shell, "cmd");
+        assert_eq!(remote.as_deref(), Some("win"));
+        assert_eq!(agent.as_deref(), Some("claude"));
+        assert_eq!(program.as_deref(), Some("claude"));
+        assert_eq!(remote_dir, None);
+        // A file from the previous build: no wrapper.
+        match serde_json::from_str(
+            r#"{"kind":"Terminal","shell":"cmd","remote":"win","agent":"codex","program":"codex"}"#,
+        )
+        .unwrap()
+        {
+            ContentSnap::Terminal {
+                program, wrapper, ..
+            } => {
+                assert_eq!(program.as_deref(), Some("codex"));
+                assert_eq!(wrapper, None);
             }
             _ => panic!("expected Terminal"),
         }
@@ -618,6 +706,7 @@ mod tests {
             remote: Some("desk".into()),
             agent: Some("claude".into()),
             program: Some("claude".into()),
+            wrapper: None,
             remote_dir: Some("/home/me/app".into()),
         };
         let json = serde_json::to_string(&snap).unwrap();
@@ -717,6 +806,7 @@ mod tests {
                             remote: None,
                             agent: None,
                             program: None,
+                            wrapper: None,
                             remote_dir: None,
                         },
                     }],

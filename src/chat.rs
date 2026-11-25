@@ -523,6 +523,9 @@ struct MemberState {
     /// Urgent posts delivered beyond a held cursor; dedup metadata, not a queue.
     delivered: std::collections::BTreeSet<u64>,
     exited: bool,
+    /// Left for good ([`ChatRoom::leave`]): [`ChatRoom::rejoin`] never brings
+    /// it back.
+    left: bool,
     is_human: bool,
     reception: Reception,
 }
@@ -579,6 +582,7 @@ impl ChatRoom {
                 cursor: 0,
                 delivered: Default::default(),
                 exited: false,
+                left: false,
                 is_human: true,
                 reception: Reception::Everything,
             },
@@ -712,6 +716,7 @@ impl ChatRoom {
                 cursor: 0,
                 delivered: Default::default(),
                 exited: false,
+                left: false,
                 is_human: false,
                 reception,
             },
@@ -739,16 +744,47 @@ impl ChatRoom {
     /// again, with a Joined line, its cursor where it stopped so posts sent
     /// while it was down still reach it. Unknown ids stay out (a restored
     /// Session was never a Member).
+    /// A Member that [`Self::leave`] took out stays out.
     pub fn rejoin(&mut self, id: &str, name: &str) {
         let Some(m) = self.member_mut(id) else {
             return;
         };
-        if !m.exited {
+        if !m.exited || m.left {
             return;
         }
         m.exited = false;
         m.name = name.to_string();
         self.log.sys(ChatKind::Joined, id, name);
+    }
+
+    /// Take Member `id` out of the room for good: its pane is no longer an
+    /// agent (a reconnect opened a shell in place of a command foreman could
+    /// not vouch for), and a shell runs whatever is typed into it. It reads
+    /// as exited, with one `Exited` line (none if the room already saw it go),
+    /// so a post addressed to it is refused as one to any exited Member, and
+    /// [`Self::rejoin`] never brings it back. Unknown ids are ignored.
+    pub fn leave(&mut self, id: &str) {
+        let Some(m) = self.member_mut(id) else {
+            return;
+        };
+        m.left = true;
+        if m.exited {
+            return;
+        }
+        m.exited = true;
+        let name = m.name.clone();
+        self.log.sys(ChatKind::Exited, id, &name);
+    }
+
+    /// Test hook: the room's log, sys lines included.
+    #[cfg(test)]
+    pub fn history_msgs(&self) -> &[ChatMsg] {
+        self.log.msgs()
+    }
+
+    /// Whether Member `id` left for good ([`Self::leave`]).
+    pub fn has_left(&self, id: &str) -> bool {
+        self.member(id).is_some_and(|m| m.left)
     }
 
     /// Append a post from the chat pane's input line. The human (`you`) is
@@ -920,9 +956,11 @@ impl ChatRoom {
 
     /// Is `id` a registered member other than the human seat (`you`)?
     /// True regardless of exited state — an exited terminal is still a member
-    /// (mirrors today's status output, which lists exited terminals).
+    /// (mirrors today's status output, which lists exited terminals). One
+    /// that left for good ([`Self::leave`]) is not: its pane runs on, as a
+    /// shell outside the room, and status must not say it gets chat.
     pub fn is_member(&self, id: &str) -> bool {
-        self.member(id).is_some_and(|m| !m.is_human)
+        self.member(id).is_some_and(|m| !m.is_human && !m.left)
     }
 
     /// Seq of the most recent log entry (any kind). 0 on an empty room.
@@ -1396,6 +1434,73 @@ mod tests {
             lines(&d, "t3"),
             [format!("[chat p1 #{down}] t1: while you were down")]
         );
+    }
+
+    /// A Member that left (its reconnect opened a shell) reads as exited:
+    /// posts to it are refused like posts to any exited Member, broadcasts
+    /// and the backlog never reach its live, ready pane, and a later
+    /// reconnect's rejoin does not bring it back.
+    #[test]
+    fn a_member_that_left_gets_nothing_and_never_rejoins() {
+        let exited_lines = |room: &ChatRoom, id: &str| {
+            room.log
+                .msgs()
+                .iter()
+                .filter(|m| m.kind == ChatKind::Exited && m.from == id)
+                .count()
+        };
+        let mut room = ChatRoom::new();
+        room.join("t1", "orchestrator");
+        room.join("t3", "remote");
+        let both = [live("t1", true, false), live("t3", true, false)];
+        room.tick("p1", &both);
+        // Dropped: the room saw it go.
+        room.tick("p1", &[live("t1", true, false), live("t3", true, true)]);
+        assert_eq!(exited_lines(&room, "t3"), 1);
+        room.post("t1", "while you were down", &[], None)
+            .expect("ok");
+        assert!(room.is_member("t3"), "exited is still a member");
+        room.leave("t3");
+        assert!(room.has_left("t3"));
+        assert!(
+            !room.is_member("t3"),
+            "status no longer lists it in the room"
+        );
+        assert_eq!(exited_lines(&room, "t3"), 1, "no second Exited line");
+        // Its shell is live and ready again, and still gets nothing.
+        room.rejoin("t3", "remote");
+        assert!(room.member("t3").unwrap().exited, "rejoin leaves it out");
+        room.post("t1", "later broadcast", &[], None).expect("ok");
+        let d = room.tick("p1", &both);
+        assert!(d.iter().all(|x| x.id != "t3"), "nothing delivered");
+        let err = room
+            .post("t1", "@t3 run this", &[], None)
+            .expect_err("a mention is refused");
+        assert_eq!(err, "t3 has exited");
+        let err = room
+            .post("t1", "run this", &["t3".to_string()], None)
+            .expect_err("--to is refused");
+        assert_eq!(err, "t3 has exited");
+        // The human's line demotes it to a broadcast, as for any exited Member.
+        let seq = room.post_human("@t3 hi").expect("posted");
+        assert!(
+            room.log
+                .msgs()
+                .iter()
+                .any(|m| m.seq == seq && m.to.is_empty())
+        );
+        assert!(
+            room.crew(std::time::Instant::now())
+                .iter()
+                .any(|r| r.id == "t3" && r.exited)
+        );
+
+        // A live Member that leaves gets its Exited line then.
+        room.join("t4", "other");
+        room.leave("t4");
+        assert_eq!(exited_lines(&room, "t4"), 1);
+        assert!(!room.has_left("t1") && !room.has_left("nobody"));
+        room.leave("nobody"); // unknown: ignored
     }
 
     #[test]
