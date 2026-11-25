@@ -176,7 +176,10 @@ process is there, and it is an ordinary member of THIS project's chat.
   itself. `reconnect tN` does what that Enter does, from this PC only; use
   it when the human asks. Until then `chat --to` it fails as exited.
 - A reconnected agent resumes its last conversation (Claude, Codex) without
-  its original prompt or flags, or starts fresh. Re-brief it by chat.
+  its original prompt or flags, or starts fresh. Re-brief it by chat. Only a
+  launch by name, by path, or through `npx`/`wsl` is an agent here: any other
+  command (`env X=1 codex "brief"`, a wrapper script) reruns as it was,
+  brief included.
 - A Windows Remote may refuse a long prompt for its command-line limit. Do
   what the error says: open without the prompt and send the brief by chat.
 - `kanban dispatch` has no `--on`; card work runs on this PC.

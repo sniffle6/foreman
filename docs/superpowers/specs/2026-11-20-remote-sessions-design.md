@@ -489,10 +489,11 @@ the ssh error can be copied. A fresh Enter (not key repeat) or a click on
 the bar relaunches the same Remote and directory; the tab title and the
 Sessions-panel row read "disconnected" until then. An agent Session
 relaunches with that provider's resume argv from one small table; a
-provider with no entry, or an agent launched through a wrapper (`npx`,
-`wsl`, a script), starts the bare provider fresh. "Is an agent" is the tab
-icon's test, so the icon and reconnect never disagree. The original
-Dispatch prompt is never sent again.
+provider with no entry, or an agent launched through `npx` or `wsl`,
+starts the bare provider fresh. "Is an agent" is the program itself
+(`remote::program_agent`), not the tab icon's scan, so a command that only
+names an agent (`vi codex.md`) runs again as it was, like any other
+command. An agent's Dispatch prompt is never sent again.
 
 **Inert on a Remote Session:** file-path links (URLs still open), file
 drops and image paste (refused with a toast). The close confirm names the
@@ -914,6 +915,33 @@ matches the tab icon's substring scan just as `vim codex.md` does, so
   as a Remote `agent: "codex"` (persisted through `agent_of`), and
   `relaunch` turns it into a bare `codex`. Reconnect and restore still use
   the loose predicate.
+
+## Results, 2026-11-24, reconnect and restore by the real program
+
+Same setup, one run each. BEFORE is bbb26be; AFTER is this change. Each
+reconnect: the pane's `ssh.exe` stopped by PID, then `foreman reconnect`.
+
+| Run | BEFORE | AFTER |
+|---|---|---|
+| `vi codex.md`, reconnected | Codex v0.172.0 started (`codex --no-daemon`) | vi on `codex.md` again |
+| what the workspace saved for that pane | `agent: "codex"` | no agent |
+| BEFORE's saved file restored, then reconnected | not run | a login shell in its directory |
+| Claude after one turn, reconnected | not run | `claude --continue`, posted on the new token |
+
+- BEFORE: Codex's start screen in the throwaway directory. Nothing was
+  typed into it, and the pane was closed.
+- Restore was dead at startup on both builds: the restore read
+  `config::live` before the frame seeded it, so every saved Remote tab came
+  back as a local shell. AFTER seeds the settings first. The BEFORE file
+  then restored as a disconnected Remote with no agent.
+- Claude: one turn posted `ALPHA`. After the reconnect the Remote ran
+  `claude --settings <hooks> --continue`, the old turn was on screen, the
+  fresh note came after the hold, and a post asking for `BRAVO` got
+  `BRAVO` back through the room.
+- Cleanup: vi quit with `:q!`, nothing saved. Directories and the Claude
+  transcript removed. Instances stopped by PID, sandbox workspace restored.
+  Claude's trust entry for the deleted directory stays in the Remote's
+  `~/.claude.json`.
 
 ## Order of work
 

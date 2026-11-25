@@ -115,8 +115,8 @@ take the local hook lane from there.
 
 - **Only a bare `claude` on a POSIX Remote gets hooks.** A wrapper (`npx …`),
   a user's own `--settings`, an install Session, a shell, Codex, Grok and
-  every Windows Remote get none, so no badge. A wrapper's reconnect
-  relaunches bare `claude` and does get them; every reconnect leases a new
+  every Windows Remote get none, so no badge. An `npx`/`wsl` launch's
+  reconnect relaunches bare `claude` and does get them; every reconnect leases a new
   token, which the hooks read from `$FOREMAN_TOKEN`. Windows is unproved, and
   the encoded hooks would take about 3 KB of the 8000-character line a
   dispatched brief has to fit in.

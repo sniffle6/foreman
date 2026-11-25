@@ -1079,16 +1079,19 @@ impl WindowManager {
                 let content = match &t.content {
                     // A Remote Session keeps its provider name (never the
                     // prompt) and directory; a local one writes neither, so
-                    // its JSON is what it was before Remotes.
+                    // its JSON is what it was before Remotes. `agent` is the
+                    // same name again, for older builds.
                     Content::Terminal(s) => {
                         let remote = s.remote().map(str::to_string);
                         let on_remote = remote.is_some();
+                        let program = on_remote
+                            .then(|| crate::remote::program_agent(s.dispatched()))
+                            .flatten()
+                            .map(|p| p.agent.to_string());
                         ContentSnap::Terminal {
                             shell: shell_to_str(s.shell).into(),
-                            agent: on_remote
-                                .then(|| crate::remote::agent_of(s.dispatched()))
-                                .flatten()
-                                .map(str::to_string),
+                            agent: program.clone(),
+                            program,
                             remote_dir: on_remote
                                 .then(|| s.remote_dir().map(str::to_string))
                                 .flatten(),
@@ -1352,11 +1355,13 @@ impl WindowManager {
 
             for (i, tab_snap) in win_snap.tabs.iter().enumerate() {
                 let content = match &tab_snap.content {
+                    // `agent` is never read: see its field.
                     ContentSnap::Terminal {
                         shell,
                         remote,
-                        agent,
+                        program,
                         remote_dir,
+                        ..
                     } => {
                         let tid = restored_identity_id(&mut self.next, win_id, &mut win_id_taken);
                         let live = crate::config::live(ctx);
@@ -1368,7 +1373,7 @@ impl WindowManager {
                             Some(Ok(name)) => {
                                 // Only a known provider name: the file is
                                 // data, and this becomes the program Enter runs.
-                                let agent = agent
+                                let agent = program
                                     .as_deref()
                                     .filter(|a| crate::board::AGENTS.contains(a));
                                 let mut s = Session::disconnected_remote(
@@ -3669,8 +3674,8 @@ impl WindowManager {
             .map_err(|e| format!("spawn failed: {e}"))?;
         // An agent opening here has been logged in to (or is about to be):
         // the row stops saying "needs login".
-        if let Some(p) = crate::remote::agent_of(argv) {
-            crate::remote_install::clear_ended(&remote.target, p);
+        if let Some(p) = crate::remote::program_agent(argv) {
+            crate::remote_install::clear_ended(&remote.target, p.agent);
         }
         // Before the note is armed: a typed note waits too.
         if let Some(until) = hold {
@@ -11922,6 +11927,7 @@ mod tests {
                                             shell: "cmd".into(),
                                             remote: None,
                                             agent: None,
+                                            program: None,
                                             remote_dir: None,
                                         },
                                     }],
@@ -13544,9 +13550,20 @@ mod tests {
         remote_agent_snap(remote, None, None)
     }
 
+    /// What this build saves for a Remote agent: `program`, with `agent`
+    /// the same name for older builds.
     fn remote_agent_snap(
         remote: &str,
         agent: Option<&str>,
+        dir: Option<&str>,
+    ) -> crate::workspace::ManagerSnap {
+        remote_snap(remote, agent, agent, dir)
+    }
+
+    fn remote_snap(
+        remote: &str,
+        agent: Option<&str>,
+        program: Option<&str>,
         dir: Option<&str>,
     ) -> crate::workspace::ManagerSnap {
         use crate::workspace::{ContentSnap, ManagerSnap, TabSnap, WinSnap};
@@ -13560,6 +13577,7 @@ mod tests {
                         shell: "cmd".into(),
                         remote: Some(remote.into()),
                         agent: agent.map(str::to_string),
+                        program: program.map(str::to_string),
                         remote_dir: dir.map(str::to_string),
                     },
                     ..Default::default()
@@ -13606,11 +13624,13 @@ mod tests {
             crate::workspace::ContentSnap::Terminal {
                 remote,
                 agent,
+                program,
                 remote_dir,
                 ..
             } => {
                 assert_eq!(remote.as_deref(), Some("desk"));
                 assert_eq!(agent.as_deref(), Some("claude"));
+                assert_eq!(program.as_deref(), Some("claude"));
                 assert_eq!(remote_dir.as_deref(), Some("/srv/app"));
             }
             _ => panic!("expected Terminal"),
@@ -13624,6 +13644,75 @@ mod tests {
             panic!("expected a terminal");
         };
         assert!(s.dispatched().is_empty(), "{:?}", s.dispatched());
+    }
+
+    /// A file from a build before `program` saved `vi codex.md` as the
+    /// Remote agent "codex", and a real Codex the same way. Neither is
+    /// trusted: both restore as a Remote shell, so Enter starts no program
+    /// the human never ran. A file this build wrote still resumes.
+    #[test]
+    fn an_old_saved_agent_label_restores_as_a_shell() {
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".into());
+        wm.apply_manager(
+            &remote_snap("desk", Some("codex"), None, Some("/tmp/x")),
+            &ctx,
+        );
+        let Content::Terminal(s) = &wm.windows[0].tabs[0].content else {
+            panic!("expected a terminal");
+        };
+        assert!(s.disconnected());
+        assert!(s.dispatched().is_empty(), "{:?}", s.dispatched());
+        assert!(crate::remote::reconnect_argv(s.dispatched()).is_empty());
+        assert_eq!(
+            s.disconnect_text(),
+            "Not connected to desk — Enter to connect"
+        );
+        assert_eq!(s.remote_dir(), Some("/tmp/x"), "the directory still counts");
+        match &wm.capture_manager().windows[0].tabs[0].content {
+            crate::workspace::ContentSnap::Terminal { agent, program, .. } => {
+                assert_eq!((agent, program), (&None, &None), "saved as a shell");
+            }
+            _ => panic!("expected Terminal"),
+        }
+        // The shape this build writes.
+        let mut wm = WindowManager::new();
+        wm.tag = Some("p1".into());
+        wm.apply_manager(&remote_snap("desk", None, Some("codex"), None), &ctx);
+        let Content::Terminal(s) = &wm.windows[0].tabs[0].content else {
+            panic!("expected a terminal");
+        };
+        assert_eq!(
+            crate::remote::reconnect_argv(s.dispatched()),
+            ["codex", "resume", "--last"]
+        );
+    }
+
+    /// A live Remote command that only mentions an agent saves as a plain
+    /// Remote Session: no agent label for this build or an older one.
+    #[test]
+    fn a_live_remote_mention_saves_no_agent() {
+        let mut wm = WindowManager::new();
+        let pid = push(&mut wm, "proj");
+        let ctx = egui::Context::default();
+        seed_desk_remote(&ctx);
+        wm.open_dispatch(open_on("desk", Some("/tmp"), &["vi", "codex.md"]), &ctx)
+            .expect("ssh spawns");
+        let snap = wm.project_child_mut(pid).unwrap().capture_manager();
+        match &snap.windows[0].tabs[0].content {
+            crate::workspace::ContentSnap::Terminal {
+                remote,
+                agent,
+                program,
+                ..
+            } => {
+                assert_eq!(remote.as_deref(), Some("desk"));
+                assert_eq!((agent, program), (&None, &None));
+            }
+            _ => panic!("expected Terminal"),
+        }
     }
 
     /// A live Remote agent saves only its provider name: never the prompt,
@@ -13648,9 +13737,13 @@ mod tests {
         assert!(!json.contains("secret brief"), "{json}");
         match &snap.windows[0].tabs[0].content {
             crate::workspace::ContentSnap::Terminal {
-                agent, remote_dir, ..
+                agent,
+                program,
+                remote_dir,
+                ..
             } => {
                 assert_eq!(agent.as_deref(), Some("claude"));
+                assert_eq!(program.as_deref(), Some("claude"));
                 assert_eq!(remote_dir.as_deref(), Some("/tmp"));
             }
             _ => panic!("expected Terminal"),
@@ -16418,6 +16511,7 @@ mod tests {
                 shell: "cmd".into(),
                 remote: None,
                 agent: None,
+                program: None,
                 remote_dir: None,
             },
         };
@@ -16465,6 +16559,7 @@ mod tests {
                 shell: "cmd".into(),
                 remote: None,
                 agent: None,
+                program: None,
                 remote_dir: None,
             },
         };
@@ -16562,6 +16657,7 @@ mod tests {
                                 shell: "cmd".into(),
                                 remote: None,
                                 agent: None,
+                                program: None,
                                 remote_dir: None,
                             },
                         }],
@@ -17326,11 +17422,20 @@ mod tests {
                 crate::remote_install::session_argv(&desk, provider).unwrap(),
             );
             assert_eq!(s.icon_kind(), crate::icons::IconKind::Cmd, "{provider}");
-            assert_eq!(crate::remote::agent_of(s.dispatched()), None);
+            assert_eq!(crate::remote::program_agent(s.dispatched()), None);
             match &wm.capture_manager().windows[0].tabs[0].content {
-                crate::workspace::ContentSnap::Terminal { remote, agent, .. } => {
+                crate::workspace::ContentSnap::Terminal {
+                    remote,
+                    agent,
+                    program,
+                    ..
+                } => {
                     assert_eq!(remote.as_deref(), Some("desk"));
-                    assert_eq!(agent.as_deref(), None, "{provider} saved as an agent");
+                    assert_eq!(
+                        (agent, program),
+                        (&None, &None),
+                        "{provider} saved as an agent"
+                    );
                 }
                 _ => panic!("expected Terminal"),
             }

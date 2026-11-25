@@ -299,17 +299,6 @@ pub fn carries_tunnel(argv: &[String]) -> bool {
     install_of(argv).is_none()
 }
 
-/// The agent provider (`claude` / `codex` / `grok`, from `board::AGENTS`)
-/// an argv runs, by the same scan the tab icon uses
-/// ([`crate::icons::IconKind::from_argv`]). The one "looks like an agent"
-/// predicate for the icon and reconnect: they must agree, or an argv that
-/// shows the Claude icon could replay its prompt on reconnect. It matches a
-/// mere mention (`vi codex.md`), so nothing that types into the pane or
-/// changes the launch decides by it: that is [`program_agent`].
-pub fn agent_of(argv: &[String]) -> Option<&'static str> {
-    crate::icons::IconKind::from_argv(argv).and_then(crate::icons::IconKind::provider)
-}
-
 /// Launchers whose next argument (after an optional `--`) is the program
 /// they run, as foreman's own tests and [`relaunch`] name them.
 const AGENT_WRAPPERS: &[&str] = &["npx", "wsl"];
@@ -335,9 +324,12 @@ pub struct ProgramAgent {
 /// agent's npm package (`npx @openai/codex`, `wsl -- codex`). Anything that
 /// only mentions an agent (`vi codex.md`, `tail -f grok.log`,
 /// `env X=1 codex`, `bash -c "codex …"`, `npx -y @openai/codex`) is not one.
-/// The one predicate for every Remote launch decision that types into the
-/// pane or changes what runs: the reply note ([`note_route`],
-/// [`typed_route`]), Claude's hooks and its chat hold ([`hooked_claude`]).
+/// The one predicate for every Remote decision that types into the pane or
+/// changes what runs: the reply note ([`note_route`], [`typed_route`]),
+/// Claude's hooks and its chat hold ([`hooked_claude`]), what a reconnect
+/// runs ([`relaunch`]) and the agent a saved workspace restores. The tab
+/// icon ([`crate::icons::IconKind::from_argv`]) also matches a mention and
+/// decides nothing.
 /// A wrong yes pastes the note and an Enter into whatever it is; a wrong no
 /// only waits for a post to carry the note.
 pub fn program_agent(argv: &[String]) -> Option<ProgramAgent> {
@@ -488,7 +480,8 @@ pub fn prompt_index(argv: &[String]) -> Option<usize> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relaunch {
     pub argv: Vec<String>,
-    /// The agent provider, when the original argv was an agent.
+    /// The agent provider, when the original argv's program was one
+    /// ([`program_agent`]).
     pub agent: Option<&'static str>,
     /// The argv reopens the agent's latest conversation (a resume entry).
     pub resumes: bool,
@@ -497,15 +490,18 @@ pub struct Relaunch {
     pub install: Option<&'static str>,
 }
 
-/// What a reconnect runs for a Session launched with `original`. An agent
-/// whose program IS the provider (`claude`, `C:\bin\claude.exe`) gets the
-/// provider's resume arguments from [`RESUME`], or none at all. Anything else
-/// that looks like an agent (`npx @anthropic-ai/claude-code "do X"`,
-/// `wsl claude …`, a wrapper script) fails safe: the bare provider, fresh,
-/// with no argument from the original argv, since any of them may be the
-/// Dispatch prompt. A shell stays a shell, and any other command runs again
-/// as it was. An install Session (see [`install_of`]) comes back as a shell,
-/// checked first because the claude and codex install URLs name the agent.
+/// What a reconnect runs for a Session launched with `original`. Decided by
+/// [`program_agent`], never by a mention: `vi codex.md` reruns as it was.
+/// An agent run by itself (`claude`, `C:\bin\claude.exe`) gets the
+/// provider's resume arguments from [`RESUME`], or none at all. One run
+/// through a wrapper [`program_agent`] accepts (`npx @anthropic-ai/claude-code
+/// "do X"`, `wsl claude …`) fails safe: the bare provider, fresh, with no
+/// argument from the original argv, since any of them may be the Dispatch
+/// prompt. A shell stays a shell, and any other command runs again as it
+/// was, arguments and all (`env X=1 codex "brief"` included: foreman cannot
+/// tell a prompt from a file name in a command it does not know). An install
+/// Session (see [`install_of`]) comes back as a shell, checked first because
+/// the claude and codex install URLs name the agent.
 pub fn relaunch(original: &[String]) -> Relaunch {
     if let Some(provider) = install_of(original) {
         return Relaunch {
@@ -515,7 +511,7 @@ pub fn relaunch(original: &[String]) -> Relaunch {
             install: Some(provider),
         };
     }
-    let Some(agent) = agent_of(original) else {
+    let Some(ProgramAgent { agent, wrapped }) = program_agent(original) else {
         return Relaunch {
             argv: original.to_vec(),
             agent: None,
@@ -523,13 +519,7 @@ pub fn relaunch(original: &[String]) -> Relaunch {
             install: None,
         };
     };
-    let program = &original[0];
-    let stem = std::path::Path::new(program)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(program)
-        .to_ascii_lowercase();
-    if stem != agent {
+    if wrapped {
         return Relaunch {
             argv: vec![agent.to_string()],
             agent: Some(agent),
@@ -542,7 +532,7 @@ pub fn relaunch(original: &[String]) -> Relaunch {
         .find(|(p, _)| *p == agent)
         .map_or(&[][..], |(_, args)| *args);
     Relaunch {
-        argv: std::iter::once(program.clone())
+        argv: std::iter::once(original[0].clone())
             .chain(resume.iter().map(|a| a.to_string()))
             .collect(),
         agent: Some(agent),
@@ -1164,20 +1154,20 @@ mod tests {
         }
     }
 
-    /// Anything the tab icon calls an agent, but whose program is not the
-    /// provider itself, relaunches the bare provider: no word of the
-    /// original argv survives, so the prompt cannot ride along.
+    /// An agent run through a wrapper [`program_agent`] accepts relaunches
+    /// the bare provider: no word of the original argv survives, so the
+    /// prompt cannot ride along.
     #[test]
     fn a_wrapped_agent_relaunches_bare_and_never_carries_the_prompt() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let prompt = "do X";
         for (original, want) in [
             (v(&["npx", "@anthropic-ai/claude-code", prompt]), "claude"),
+            (v(&["npx", "@openai/codex", prompt]), "codex"),
+            (v(&["npx.cmd", "codex", prompt]), "codex"),
             (v(&["wsl", "claude", prompt]), "claude"),
             (v(&["wsl", "--", "codex", prompt]), "codex"),
-            (v(&["my-claude-wrapper.cmd", prompt]), "claude"),
-            (v(&["python", "claude_tool.py", prompt]), "claude"),
-            (v(&["bash", "-lc", &format!("grok {prompt}")]), "grok"),
+            (v(&["wsl", "--", "grok", prompt]), "grok"),
             // The prompt names another provider: the launched agent wins.
             (v(&["wsl", "codex", "compare with claude"]), "codex"),
         ] {
@@ -1193,30 +1183,137 @@ mod tests {
         }
     }
 
-    /// One predicate: whatever the icon calls an agent, reconnect treats as
-    /// one, and the providers are the board's list.
+    /// Reconnect decides by the PROGRAM ([`program_agent`]), never by the
+    /// tab icon's scan: a command that only mentions an agent reruns as it
+    /// was, exactly like any other command, and starts no agent. The rows
+    /// are the note table's (`the_reply_note_s_route_per_agent_and_shell`).
     #[test]
-    fn the_agent_predicate_is_the_icon_s() {
+    fn reconnect_decides_by_the_program_not_a_mention() {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        for argv in [
-            v(&["claude"]),
-            v(&["npx", "@anthropic-ai/claude-code", "x"]),
-            v(&["codex", "exec", "y"]),
-            v(&["grok"]),
-            v(&["python", "claude_tool.py"]),
-            v(&["htop"]),
-            v(&[]),
-        ] {
-            let icon = crate::icons::IconKind::from_argv(&argv);
+        let brief = "do the card now";
+        let bash_c = format!("codex \"{brief}\"");
+        // Rerun as it was: no agent, no resume.
+        let same = |a: &[&str]| (v(a), v(a), None, false);
+        // (original, what a reconnect runs, its agent, resumes)
+        let table: Vec<(Vec<String>, Vec<String>, Option<&str>, bool)> = vec![
+            // Mentions.
+            same(&["vi", "codex.md"]),
+            same(&["vim", "codex.md"]),
+            same(&["tail", "-f", "grok.log"]),
+            same(&["tail", "-f", "/var/log/grok.log"]),
+            same(&["cat", "claude.txt"]),
+            same(&["/opt/claude/bin/python", "script.py"]),
+            same(&["python", "claude_tool.py", brief]),
+            same(&["bash", "-c", &bash_c]),
+            // A wrapper program_agent does not accept is no agent either:
+            // its own command, prompt and all.
+            same(&["env", "VAR=1", "codex", brief]),
+            same(&["codex-wrapper", brief]),
+            same(&["my-claude-wrapper.cmd", brief]),
+            same(&["npx", "-y", "@openai/codex", brief]),
+            same(&["npx", "@openai/codex-sdk", brief]),
+            same(&["wsl", "-d", "codex", "bash"]),
+            same(&["npx"]),
+            // Accepted wrappers: the bare provider, fresh.
+            (
+                v(&["npx", "@openai/codex", brief]),
+                v(&["codex"]),
+                Some("codex"),
+                false,
+            ),
+            (
+                v(&["npx", "@anthropic-ai/claude-code", brief]),
+                v(&["claude"]),
+                Some("claude"),
+                false,
+            ),
+            (
+                v(&["npx", "claude", brief]),
+                v(&["claude"]),
+                Some("claude"),
+                false,
+            ),
+            (
+                v(&["wsl", "codex", brief]),
+                v(&["codex"]),
+                Some("codex"),
+                false,
+            ),
+            (
+                v(&["wsl", "--", "grok", brief]),
+                v(&["grok"]),
+                Some("grok"),
+                false,
+            ),
+            // Agents by name, path and case: resume, keeping the program.
+            (
+                v(&["claude", brief]),
+                v(&["claude", "--continue"]),
+                Some("claude"),
+                true,
+            ),
+            (
+                v(&["codex", "exec", brief]),
+                v(&["codex", "resume", "--last"]),
+                Some("codex"),
+                true,
+            ),
+            (
+                v(&["/home/u/.npm-global/bin/codex", brief]),
+                v(&["/home/u/.npm-global/bin/codex", "resume", "--last"]),
+                Some("codex"),
+                true,
+            ),
+            (
+                v(&["/usr/bin/Claude", brief]),
+                v(&["/usr/bin/Claude", "--continue"]),
+                Some("claude"),
+                true,
+            ),
+            (
+                v(&["Codex", "exec", brief]),
+                v(&["Codex", "resume", "--last"]),
+                Some("codex"),
+                true,
+            ),
+            (
+                v(&[r"C:\npm\claude.CMD", brief]),
+                v(&[r"C:\npm\claude.CMD", "--continue"]),
+                Some("claude"),
+                true,
+            ),
+            (
+                v(&["grok.exe", brief]),
+                v(&["grok.exe"]),
+                Some("grok"),
+                false,
+            ),
+            // A shell and a plain command, as before.
+            same(&[]),
+            same(&["htop", "-d", "5"]),
+        ];
+        for (original, argv, agent, resumes) in &table {
+            let r = relaunch(original);
+            assert_eq!(&r.argv, argv, "{original:?}");
+            assert_eq!(r.agent, *agent, "{original:?}");
+            assert_eq!(r.resumes, *resumes, "{original:?}");
             assert_eq!(
-                agent_of(&argv),
-                icon.and_then(crate::icons::IconKind::provider)
+                r.agent,
+                program_agent(original).map(|p| p.agent),
+                "one predicate: {original:?}"
             );
-            assert_eq!(relaunch(&argv).agent.is_some(), icon.is_some(), "{argv:?}");
-            if let Some(a) = agent_of(&argv) {
-                assert!(crate::board::AGENTS.contains(&a));
+            if r.agent.is_none() {
+                assert_eq!(
+                    program_agent(&r.argv),
+                    None,
+                    "starts no agent: {original:?}"
+                );
+            } else if program_agent(original).is_some_and(|p| p.wrapped) {
+                assert!(!r.argv.iter().any(|a| a.contains(brief)), "{original:?}");
             }
         }
+        // The tab icon still calls a mention an agent; it decides nothing.
+        assert!(crate::icons::IconKind::from_argv(&v(&["vi", "codex.md"])).is_some());
     }
 
     fn remote(shell: RemoteShell) -> Remote {
@@ -1866,7 +1963,7 @@ mod tests {
                 let i = install_for(provider, shell).unwrap();
                 let argv = install_argv(shell, i.command);
                 assert_eq!(crate::icons::IconKind::from_argv(&argv), None, "{argv:?}");
-                assert_eq!(agent_of(&argv), None, "{argv:?}");
+                assert_eq!(program_agent(&argv), None, "{argv:?}");
                 assert!(!carries_tunnel(&argv), "{argv:?}");
             }
         }
@@ -2123,7 +2220,7 @@ mod tests {
             let a = argv(words);
             assert_eq!(note_route(&a, *shell), *note, "{words:?} on {shell:?}");
             assert_eq!(hooked_claude(&a, *shell), *hold, "{words:?} on {shell:?}");
-            if *note == AtLaunch && agent_of(&a) == Some("claude") {
+            if *note == AtLaunch && program_agent(&a).is_some_and(|p| p.agent == "claude") {
                 assert!(
                     hold.is_some(),
                     "a Claude is typed into only behind a hold: {words:?}"

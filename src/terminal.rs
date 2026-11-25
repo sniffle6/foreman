@@ -2733,7 +2733,7 @@ impl Session {
         }
         if cue_in.is_some_and(|w| w.is_zero()) && rect.height() >= bar_h + rh {
             let strip = rect.with_min_y(rect.max.y - bar_h);
-            let agent = crate::remote::agent_of(self.dispatched());
+            let agent = crate::remote::program_agent(self.dispatched()).map(|p| p.agent);
             let c = HeldCue::layout(ui, strip, agent, &th);
             let r = ui
                 .interact(

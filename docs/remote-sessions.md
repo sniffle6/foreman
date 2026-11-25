@@ -25,12 +25,13 @@ is for changing the feature.
   them. `ps_mkdir_script` alone also runs in the unit tests through a local
   PowerShell, with no SSH.
 - **An install Session's argv names the agent.** The Claude and Codex
-  install URLs contain `claude` / `codex`. `IconKind::from_argv` returns
-  `None` for an `install_of` argv, so the icon, `agent_of`, the badges and the
-  workspace snapshot all treat an install tab as a plain Remote shell. A new
-  "is this an agent" check must go through `agent_of`. A substring scan of
-  its own turns install tabs back into agents, except Grok's, whose URL has
-  no agent name in it. Install Sessions get no Tunnel
+  install URLs contain `claude` / `codex`. `IconKind::from_argv` and
+  `remote::program_agent` both return `None` for an `install_of` argv, so
+  the icon, the badges, reconnect and the workspace snapshot all treat an
+  install tab as a plain Remote shell. A new check that decides what runs or
+  what is typed must go through `program_agent`. A substring scan of its own
+  turns install tabs back into agents, except Grok's, whose URL has no agent
+  name in it. Install Sessions get no Tunnel
   (`remote::carries_tunnel`).
 - **`start_test` does nothing while a Test runs.** When something changed
   the Remote (an install ended), call `retest`: it owes one more run after
@@ -167,14 +168,25 @@ is for changing the feature.
   hookless Claude gets no note typed at launch, so a Dispatch alone cannot
   quit it, and it cannot post until it is posted to. Codex and Grok get the
   note typed at Ready, since a Dispatch may never get a post to carry it.
-- **Only an agent PROGRAM is typed into.** `remote::program_agent` decides
-  every Remote launch choice (typed note, hooks, hold): argv[0]'s stem is
-  the agent, or `npx`/`wsl` runs the bare name or its npm package. The tab
-  icon's `agent_of` also matches a mention, and on it `vi codex.md` got the
-  note and its Enter typed into vi (2026-11-24). Anything else (`env X=1
-  codex`, `bash -c "codex …"`, `npx -y @openai/codex`) gets the note with
-  its first post. Reconnect and restore still use `agent_of`, so a
-  reconnected `vi codex.md` starts a bare `codex`.
+- **Only an agent PROGRAM is typed into or resumed.** `remote::program_agent`
+  decides every Remote choice of what runs or what is typed (typed note,
+  hooks, hold, what reconnect runs, the agent the workspace saves):
+  argv[0]'s stem is the agent, or `npx`/`wsl` runs the bare name or its npm
+  package. The tab icon's scan (`IconKind::from_argv`) also matches a
+  mention and decides nothing. On it `vi codex.md` got the note and its
+  Enter typed into vi, and its reconnect started `codex resume --last`
+  (2026-11-24).
+- **A command that is no agent program reruns as it was on reconnect,
+  arguments and all.** `env X=1 codex "brief"`, `bash -c "codex …"` and a
+  wrapper script replay their brief, as `python tool.py "brief"` always
+  did: foreman cannot tell a prompt from a file name in a command it does
+  not know. Launch an agent by name, by path, or through `npx`/`wsl` for it
+  to resume without its prompt.
+- **A workspace saved before `program` restores every Remote pane as a
+  shell.** The old `agent` field came from the icon's scan, so a saved
+  `vi codex.md` and a real Codex look the same; neither is trusted
+  (`ContentSnap::Terminal`). Builds still write `agent` too, so an older
+  build restores a newer file's agents.
 - **Typed input at Ready can answer Codex's update prompt.** Seen
   2026-11-24: a reconnect's `codex resume --last` showed "update available"
   and the carried posts' paste and Enter picked its default. Codex ran
@@ -272,8 +284,8 @@ is for changing the feature.
   and an uncertain input must never be resent by itself. Reconnect is the
   human's Enter on the disconnect bar, or `foreman reconnect tN`, which does
   the same through this PC's pipe only: a peer and the Tunnel cannot send
-  it, so a Remote agent cannot reconnect a pane. The Dispatch prompt is never
-  sent again.
+  it, so a Remote agent cannot reconnect a pane. An agent program's Dispatch
+  prompt is never sent again.
 - **The typed note writes URL and token out; the in-prompt one names
   `$FOREMAN_URL` and `$FOREMAN_TOKEN`.** The prompt is argv, which every user
   on the Remote can read. A typed note is not, and it also serves Grok and
