@@ -2117,6 +2117,7 @@ mod tests {
                 curl: false,
                 bash: false,
                 agents: vec!["claude".into()],
+                git: None,
             }),
         );
         for (key, state) in [
@@ -2170,6 +2171,7 @@ mod tests {
                 curl,
                 bash,
                 agents: agents.iter().map(|a| a.to_string()).collect(),
+                git: None,
             })
         };
         menu.remotes
@@ -2313,6 +2315,7 @@ mod tests {
                 curl,
                 bash,
                 agents: vec![],
+                git: None,
             };
             for a in each("claude", &report) {
                 for b in each("codex", &report) {
@@ -2394,6 +2397,7 @@ mod tests {
                         curl: true,
                         bash: true,
                         agents: vec![],
+                        git: None,
                     }),
                 );
                 frame_at(&ctx, &mut menu, &mut s, Some(size), None);
@@ -2501,6 +2505,7 @@ mod tests {
                     curl: true,
                     bash: true,
                     agents: vec!["claude".into()],
+                    git: None,
                 }),
             );
         }
@@ -3087,5 +3092,100 @@ mod tests {
         assert!(matches!(o, MenuOutcome::CheckUpdatesNow));
         bump(&mut o, MenuOutcome::Close);
         assert!(matches!(o, MenuOutcome::Close));
+    }
+
+    /// At the narrowest pane: the git line and its "use this PC's" button
+    /// sit inside the pane on one line, the footers offering G are whole,
+    /// and neither a Test landing nor the git confirm moves a row.
+    #[test]
+    fn remotes_git_line_fits_at_minimum_width_and_moves_nothing() {
+        use crate::remote::RemoteShell;
+        use crate::remote_probe::{GitInfo, TestOutcome, TestReport};
+        use crate::remotes_pane::LINE_H;
+        let size = egui::vec2(RAIL_W + PANE_MIN_W, SettingsMenu::min_size().y);
+        let ctx = egui::Context::default();
+        let mut menu = SettingsMenu::new();
+        let mut s = Settings {
+            remotes: vec![
+                remote("desk", "layout-git-desk"),
+                remote("pi", "layout-git-pi"),
+            ],
+            ..Default::default()
+        };
+        menu.select_pane(Pane::Remotes);
+        menu.in_rail = false;
+        menu.remotes.set_install_project(Some("proj"));
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        let untested = menu.remotes.laid().rows.clone();
+        let report = |agents: &[&str], name: &str, email: &str| {
+            TestOutcome::Ok(TestReport {
+                shell: RemoteShell::Posix,
+                login_shell: None,
+                curl: true,
+                bash: true,
+                agents: agents.iter().map(|a| a.to_string()).collect(),
+                git: Some(GitInfo {
+                    version: "2.45.1.windows.1".into(),
+                    name: name.into(),
+                    email: email.into(),
+                }),
+            })
+        };
+        // desk lacks both and an agent (the footer with I and G); pi has a
+        // long identity and no button.
+        menu.remotes
+            .set_test_result("layout-git-desk", report(&["claude", "codex"], "", ""));
+        menu.remotes.set_test_result(
+            "layout-git-pi",
+            report(
+                &["claude", "codex", "grok"],
+                "A Rather Long Author Name",
+                "a-rather-long-address@a-long-host.example.internal",
+            ),
+        );
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        let laid = menu.remotes.laid();
+        assert_eq!(laid.rows, untested, "a Test result moved a row");
+        assert_eq!(laid.git.len(), 2);
+        for g in &laid.git {
+            assert!(g.height() <= LINE_H + 0.5, "git line {g:?}");
+            assert!(laid.pane.contains_rect(*g), "{g:?}");
+        }
+        assert_eq!(laid.git_fixes.len(), 1, "{:?}", laid.git_fixes);
+        let b = laid.git_fixes[0];
+        assert!(laid.git[0].contains_rect(b), "{b:?} past {:?}", laid.git[0]);
+        assert!(menu.footer_laid.0.contains("I install") && menu.footer_laid.0.contains("G git"));
+        assert!(menu.footer_laid.1, "the footer with I and G is cut");
+
+        let none = egui::Modifiers::NONE;
+        frame_at(
+            &ctx,
+            &mut menu,
+            &mut s,
+            Some(size),
+            Some((egui::Key::G, none)),
+        );
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        // Under test this PC has no git name, so G says why in the footer.
+        assert!(!menu.remotes.is_editing());
+        assert_eq!(menu.remotes.laid().rows, untested, "G moved a row");
+
+        // The second row: the G-only footer is not offered (it lacks nothing).
+        frame_at(
+            &ctx,
+            &mut menu,
+            &mut s,
+            Some(size),
+            Some((egui::Key::ArrowDown, none)),
+        );
+        frame_at(&ctx, &mut menu, &mut s, Some(size), None);
+        assert!(
+            !menu.footer_laid.0.contains("G git"),
+            "{}",
+            menu.footer_laid.0
+        );
+        assert!(menu.footer_laid.1);
     }
 }

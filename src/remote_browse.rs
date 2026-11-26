@@ -408,7 +408,7 @@ fn ps_target(dir: &str) -> String {
 /// The remote line that runs one of these scripts: the script as base64,
 /// so the login shell never sees a quote or a space from a typed path or
 /// name. `None` for a Windows line past [`crate::remote::WINDOWS_LINE_CAP`].
-fn remote_line(
+pub(crate) fn remote_line(
     shell: RemoteShell,
     posix: impl FnOnce() -> String,
     ps: impl FnOnce() -> String,
@@ -439,7 +439,7 @@ pub fn list_line(shell: RemoteShell, dir: &str) -> Result<String, Failure> {
 
 /// `ssh` with `line` for `target`: never a prompt, a connect deadline, no
 /// PTY.
-fn ssh_args(target: &str, line: String) -> Vec<String> {
+pub(crate) fn ssh_args(target: &str, line: String) -> Vec<String> {
     [
         "-T",
         "-o",

@@ -402,6 +402,8 @@ pub enum Key {
     Test,
     /// Ask to install the selected Remote's first installable missing agent.
     Install,
+    /// Ask to copy this PC's git name and email to the selected Remote.
+    Git,
     /// Forget the focused Project directory row (Ctrl+Backspace, or Delete
     /// in an empty one).
     Clear,
@@ -419,6 +421,8 @@ pub enum Effect {
     Test(usize),
     /// Install this agent on the Remote at this index (confirmed).
     Install(usize, &'static str),
+    /// Write the confirmed git name and email on the Remote at this index.
+    SetGit(usize),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -430,6 +434,12 @@ enum Mode {
     ConfirmInstall {
         row: usize,
         provider: &'static str,
+    },
+    /// Showing the git name and email to write on row `row`, waiting for
+    /// Enter.
+    ConfirmGit {
+        row: usize,
+        fix: crate::remote_git::Fix,
     },
 }
 
@@ -469,6 +479,14 @@ pub struct RemotesView {
     /// The folder list under the focused Directory row. Fresh per form,
     /// so its listings live as long as the form.
     browse: Browser,
+    /// The confirmed git name and email, between Enter and its ssh starting.
+    git_fix: Option<crate::remote_git::Fix>,
+    /// How the last git write went, left by its worker for the footer line.
+    git_done: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Test hook: this PC's git name and email. Under test `git` is never
+    /// run for them.
+    #[cfg(test)]
+    local_git: crate::remote_git::Identity,
     /// Test hook: per target, agent states that stand in for the Test
     /// answer and the install marks (both shared with parallel tests).
     #[cfg(test)]
@@ -515,6 +533,10 @@ pub struct Laid {
     pub question: Option<(String, bool)>,
     /// Every agents line fits: no words cut, no button past its edge.
     pub agents_fit: bool,
+    /// Per row: its git line.
+    pub git: Vec<egui::Rect>,
+    /// Every "use this PC's" button drawn.
+    pub git_fixes: Vec<egui::Rect>,
 }
 
 impl Default for RemotesView {
@@ -547,11 +569,17 @@ impl RemotesView {
                 confirm_elided: false,
                 question: None,
                 agents_fit: true,
+                git: Vec::new(),
+                git_fixes: Vec::new(),
             },
             install_project: None,
             projects: Vec::new(),
             agents: HashMap::new(),
             browse: Browser::new(),
+            git_fix: None,
+            git_done: Default::default(),
+            #[cfg(test)]
+            local_git: Default::default(),
             #[cfg(test)]
             forced: HashMap::new(),
         }
@@ -733,6 +761,73 @@ impl RemotesView {
             .unwrap_or_else(|| format!("Every agent CLI Test looks for is on {name}"))
     }
 
+    /// What row `r`'s last finished Test read of its git: `None` before a
+    /// Test that worked, `Some(None)` when git is not installed.
+    fn git_of(&self, r: &Remote) -> Option<Option<&remote_probe::GitInfo>> {
+        match self.tests.get(&r.target)?.last.as_ref()? {
+            TestOutcome::Ok(report) => Some(report.git.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Row `i` has git but lacks a name or an email.
+    fn git_lacks(&self, i: usize, remotes: &[Remote]) -> bool {
+        remotes
+            .get(i)
+            .and_then(|r| self.git_of(r))
+            .flatten()
+            .is_some_and(|g| g.name.is_empty() || g.email.is_empty())
+    }
+
+    /// This PC's git name and email, read now.
+    fn local_identity(&self) -> crate::remote_git::Identity {
+        #[cfg(test)]
+        return self.local_git.clone();
+        #[cfg(not(test))]
+        crate::remote_git::local_identity()
+    }
+
+    /// Open the confirm that copies this PC's git name and email to row
+    /// `row`, or say why there is nothing to copy.
+    fn ask_git(&mut self, row: usize, remotes: &[Remote]) {
+        let r = &remotes[row];
+        let Some(git) = self.git_of(r).map(|g| g.cloned()) else {
+            self.message = Some(format!(
+                "Test {} first: T reads its git name and email",
+                r.name
+            ));
+            return;
+        };
+        match crate::remote_git::fix(&r.name, git.as_ref(), &self.local_identity()) {
+            Ok(fix) => {
+                self.mode = Mode::ConfirmGit { row, fix };
+                self.message = None;
+            }
+            Err(why) => self.message = Some(why),
+        }
+    }
+
+    /// Write the confirmed name and email on `r`, off the UI thread, then
+    /// Test it again so its git line shows them.
+    fn start_git(&mut self, ctx: &egui::Context, r: &Remote) {
+        let Some(fix) = self.git_fix.take() else {
+            return;
+        };
+        let (ctx, target, shell, name) = (ctx.clone(), r.target.clone(), r.shell, r.name.clone());
+        let done = self.git_done.clone();
+        remote_probe::spawn_network(move || {
+            let msg = match crate::remote_git::run_set(&target, shell, &fix) {
+                Ok(()) => {
+                    remote_probe::retest(&ctx, &target);
+                    format!("Set the git name and email on {name}")
+                }
+                Err(e) => format!("Could not set the git name and email on {name}: {e}"),
+            };
+            *done.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+            ctx.request_repaint();
+        });
+    }
+
     /// Open the add form below the list: select it and scroll it into view.
     fn begin_add(&mut self, len: usize) {
         self.selected = len;
@@ -781,8 +876,23 @@ impl RemotesView {
                         }
                     }
                 }
+                Key::Git if self.selected < len => self.ask_git(self.selected, remotes),
                 Key::Esc => return Effect::Close,
                 _ => {}
+            },
+            // The list shrank under the confirm (settings.json reloaded).
+            Mode::ConfirmGit { row, .. } if row >= len => {}
+            Mode::ConfirmGit { row, fix } => match k {
+                Key::Enter => {
+                    self.message = Some(format!(
+                        "Setting the git name and email on {}…",
+                        remotes[row].name
+                    ));
+                    self.git_fix = Some(fix);
+                    return Effect::SetGit(row);
+                }
+                Key::Esc => {}
+                _ => self.mode = Mode::ConfirmGit { row, fix },
             },
             Mode::ConfirmDelete(i) => match k {
                 Key::Enter => return self.delete(i, remotes),
@@ -1040,10 +1150,20 @@ impl RemotesView {
         let len = remotes.len();
         match &self.mode {
             Mode::Browse if self.selected < len => {
-                if self.installable(self.selected, remotes).is_empty() {
-                    "↑/↓ select · Enter edit · A add · T test · Del delete · Tab/Esc rail"
-                } else {
-                    "↑/↓ select · Enter edit · A add · T test · I install · Del delete · Tab/Esc rail"
+                let install = !self.installable(self.selected, remotes).is_empty();
+                match (install, self.git_lacks(self.selected, remotes)) {
+                    (false, false) => {
+                        "↑/↓ select · Enter edit · A add · T test · Del delete · Tab/Esc rail"
+                    }
+                    (true, false) => {
+                        "↑/↓ select · Enter edit · A add · T test · I install · Del delete · Tab/Esc rail"
+                    }
+                    (false, true) => {
+                        "↑/↓ select · Enter edit · A add · T test · G git name · Del delete · Tab/Esc rail"
+                    }
+                    (true, true) => {
+                        "↑/↓ select · Enter edit · T test · I install · G git name · Del delete · Tab/Esc rail"
+                    }
                 }
             }
             Mode::Browse if len == 0 => "Enter or A add · Tab/Esc rail",
@@ -1054,6 +1174,7 @@ impl RemotesView {
                 "Enter install · ←/→ other agent · Esc cancel"
             }
             Mode::ConfirmInstall { .. } => "Enter install · Esc cancel",
+            Mode::ConfirmGit { .. } => "Enter set them · Esc cancel",
         }
     }
 
@@ -1126,6 +1247,14 @@ impl RemotesView {
             self.browse = Browser::new();
         }
         let mut changed = self.poll_tests(remotes);
+        let landed = self
+            .git_done
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(msg) = landed {
+            self.message = Some(msg);
+        }
         let mut close = false;
         let mut install = None;
         let mut effect = |view: &mut Self, e: Effect, remotes: &mut Vec<Remote>| match e {
@@ -1138,6 +1267,7 @@ impl RemotesView {
             Effect::Install(i, provider) => {
                 install = Some((remotes[i].name.clone(), provider));
             }
+            Effect::SetGit(i) => view.start_git(&ctx, &remotes[i]),
             Effect::None => {}
         };
 
@@ -1164,6 +1294,8 @@ impl RemotesView {
         self.laid.confirm_elided = false;
         self.laid.question = None;
         self.laid.agents_fit = true;
+        self.laid.git.clear();
+        self.laid.git_fixes.clear();
         self.laid.error = None;
 
         let th = crate::theme::live(ui.ctx());
@@ -1243,6 +1375,14 @@ impl RemotesView {
                         self.ask_install(i, provider, remotes);
                     }
                 }
+                Act::AskGit(i) => {
+                    self.selected = i;
+                    // Never over an open form or another confirm.
+                    if matches!(self.mode, Mode::Browse | Mode::ConfirmGit { .. }) {
+                        self.mode = Mode::Browse;
+                        self.ask_git(i, remotes);
+                    }
+                }
                 Act::Field(f) => {
                     if let Mode::Edit(d) = &mut self.mode {
                         d.field = f;
@@ -1317,6 +1457,7 @@ impl RemotesView {
                 egui::pos2(item.max.x - PAD, row.max.y + LINE_H),
             );
             let agents_rect = status_rect.translate(egui::vec2(0.0, LINE_H));
+            let git_rect = agents_rect.translate(egui::vec2(0.0, LINE_H));
             let reach = remote_probe::reach(ui.ctx(), &r.target);
             let (dot, reach_text, why) = match &reach {
                 Reach::Checking => (th.dim, "checking…", None),
@@ -1376,6 +1517,21 @@ impl RemotesView {
                 let galley = row_ui.painter().layout_job(job);
                 self.laid.question = Some((q, !galley.elided));
                 row_ui.add(egui::Label::new(galley));
+            } else if let Mode::ConfirmGit { row: c, .. } = &self.mode
+                && *c == i
+            {
+                if row_ui.small_button("cancel").clicked() {
+                    acts.push(Act::Key(Key::Esc));
+                }
+                if row_ui
+                    .small_button(egui::RichText::new("set").color(th.border_focus))
+                    .clicked()
+                {
+                    acts.push(Act::Key(Key::Enter));
+                }
+                row_ui.add(
+                    egui::Label::new(format!("Set this PC's git name on {}?", r.name)).truncate(),
+                );
             } else {
                 if row_ui.small_button("delete").clicked() {
                     acts.push(Act::AskDelete(i));
@@ -1430,6 +1586,33 @@ impl RemotesView {
                 resp.on_hover_text(format!("{}\n{sub_text}", r.name));
             }
 
+            if let Mode::ConfirmGit { row: c, fix } = &self.mode
+                && *c == i
+            {
+                // The status and agents lines' room, given to the exact
+                // values, so opening the confirm moves nothing.
+                let shown = fix.shown();
+                let mut job = egui::text::LayoutJob::simple(
+                    shown.clone(),
+                    egui::FontId::monospace(DESC_PT),
+                    th.text,
+                    status_rect.width().max(40.0),
+                );
+                job.wrap.max_rows = 2;
+                let galley = ui.painter().layout_job(job);
+                let mut c = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(status_rect.union(agents_rect))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                c.add(egui::Label::new(galley).selectable(false))
+                    .on_hover_text(format!(
+                        "{shown}\n\nWritten to the global git config on {}. A value it already has is left alone.",
+                        r.name
+                    ));
+                ui.add_space(ITEM_GAP);
+                continue;
+            }
             let agents = self.agents_for(r);
             if let Mode::ConfirmInstall { row: c, provider } = self.mode
                 && c == i
@@ -1472,6 +1655,16 @@ impl RemotesView {
             self.laid.agents.push(line.rect);
             self.laid.installs.extend(line.installs);
             self.laid.agents_fit &= line.fits;
+            // Reserved on every row too. A re-run keeps the last answer.
+            let git = self.git_of(r).map(crate::remote_git::line);
+            let (line, fix) = git_line_ui(ui, git_rect, git.as_ref());
+            self.laid.git.push(line);
+            if let Some((rect, clicked)) = fix {
+                self.laid.git_fixes.push(rect);
+                if clicked {
+                    acts.push(Act::AskGit(i));
+                }
+            }
             ui.add_space(ITEM_GAP);
         }
 
@@ -1914,8 +2107,8 @@ const WASH_INSET: f32 = 6.0;
 const CLUSTER_GAP: f32 = 6.0;
 /// The line reserved under each row, and for the hosts strip.
 pub(crate) const LINE_H: f32 = 18.0;
-/// A collapsed Remote: its row, its status line and its agents line.
-const ITEM_H: f32 = ROW_H + 2.0 * LINE_H;
+/// A collapsed Remote: its row and its status, agents and git lines.
+const ITEM_H: f32 = ROW_H + 3.0 * LINE_H;
 /// Between one item and the next, so a wash never touches its neighbour.
 const ITEM_GAP: f32 = 4.0;
 /// A section header (appearance.rs `section_header`).
@@ -2227,6 +2420,50 @@ fn agents_line_ui(
     }
 }
 
+/// A row's git line: what Test read on the left, and a "use this PC's"
+/// button on the right when the Remote lacks a name or an email. Returns the
+/// line, and the button's rect and whether it was clicked.
+fn git_line_ui(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    line: Option<&crate::remote_git::Line>,
+) -> (egui::Rect, Option<(egui::Rect, bool)>) {
+    let Some(line) = line else {
+        return (rect, None);
+    };
+    let th = crate::theme::live(ui.ctx());
+    let mut c = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    c.spacing_mut().item_spacing.x = CLUSTER_GAP;
+    let fix = line.lacks.then(|| {
+        let b = c.small_button("use this PC's").on_hover_text(
+            "Copy this PC's git name and email to this Remote. Shows them and asks first.",
+        );
+        (b.rect, b.clicked())
+    });
+    let room = match &fix {
+        Some((b, _)) => (b.min.x - CLUSTER_GAP - rect.min.x).max(0.0),
+        None => rect.width(),
+    };
+    let g = one_line(ui, &line.text, egui::FontId::proportional(DESC_PT), room);
+    let at = egui::pos2(rect.min.x, rect.center().y - g.size().y / 2.0);
+    let r = egui::Rect::from_min_size(at, g.size());
+    let cut = g.elided;
+    ui.painter().galley(at, g, th.dim);
+    if cut {
+        ui.interact(
+            r,
+            ui.id().with(("remotes_git", rect.min.y as i32)),
+            egui::Sense::hover(),
+        )
+        .on_hover_text(&line.text);
+    }
+    (rect, fix)
+}
+
 /// The install confirm's body, in the room of a row's two lines: the exact
 /// command, wrapped (two lines hold every command in the table at the
 /// narrowest pane; anything longer is cut, whole on hover), and what will
@@ -2272,6 +2509,8 @@ enum Act {
     Test(usize),
     /// An install button: open the confirm for that agent.
     AskInstall(usize, &'static str),
+    /// A "use this PC's" button: open the git confirm.
+    AskGit(usize),
     Field(Field),
     Accept(String),
     ClearDir(usize),
@@ -2292,6 +2531,7 @@ fn browse_letter(key: egui::Key, mods: egui::Modifiers) -> Option<Key> {
         egui::Key::D => Key::Delete,
         egui::Key::T => Key::Test,
         egui::Key::I => Key::Install,
+        egui::Key::G => Key::Git,
         _ => return None,
     })
 }
@@ -2408,7 +2648,7 @@ fn read_keys(ui: &egui::Ui, mode: &Mode, list: bool, naming: bool) -> Vec<Key> {
         }
         match mode {
             Mode::Browse => {
-                for k in [K::K, K::J, K::A, K::D, K::T, K::I] {
+                for k in [K::K, K::J, K::A, K::D, K::T, K::I, K::G] {
                     if p(k)
                         && let Some(key) = browse_letter(k, i.modifiers)
                     {
@@ -2438,7 +2678,7 @@ fn read_keys(ui: &egui::Ui, mode: &Mode, list: bool, naming: bool) -> Vec<Key> {
                     }
                 }
             }
-            Mode::ConfirmDelete(_) => {}
+            Mode::ConfirmDelete(_) | Mode::ConfirmGit { .. } => {}
             Mode::ConfirmInstall { .. } => {
                 if p(K::ArrowLeft) {
                     out.push(Key::Left);
@@ -3196,6 +3436,7 @@ mod tests {
             curl: true,
             bash: false,
             agents: vec![],
+            git: None,
         });
         assert!(apply_test(&mut list, "andy@desk", &ok));
         assert_eq!(list[0].shell, RemoteShell::Pwsh);
@@ -3223,6 +3464,7 @@ mod tests {
                 curl: false,
                 bash: false,
                 agents: vec![],
+                git: None,
             })),
         };
         assert!(v.absorb("andy@desk", done.clone(), &mut list));
@@ -3242,6 +3484,7 @@ mod tests {
                 curl,
                 bash,
                 agents: agents.iter().map(|a| a.to_string()).collect(),
+                git: None,
             }),
         );
     }
@@ -3403,5 +3646,103 @@ mod tests {
         );
         assert_eq!(v.key(Key::Enter, &mut list), Effect::None);
         assert_eq!(v.mode, Mode::Browse);
+    }
+
+    fn tested_git(v: &mut RemotesView, target: &str, git: Option<(&str, &str)>) {
+        v.set_test_result(
+            target,
+            TestOutcome::Ok(TestReport {
+                shell: RemoteShell::Posix,
+                login_shell: None,
+                curl: true,
+                bash: true,
+                agents: vec!["claude".into(), "codex".into(), "grok".into()],
+                git: git.map(|(name, email)| remote_probe::GitInfo {
+                    version: "2.43.0".into(),
+                    name: name.into(),
+                    email: email.into(),
+                }),
+            }),
+        );
+    }
+
+    fn me() -> crate::remote_git::Identity {
+        crate::remote_git::Identity {
+            name: "Ann".into(),
+            email: "ann@example.com".into(),
+        }
+    }
+
+    /// G on a Remote with no git name shows this PC's values first; Esc
+    /// writes nothing, and Enter asks the caller to write exactly them.
+    #[test]
+    fn the_git_name_is_copied_only_after_a_confirm_that_shows_it() {
+        let mut v = RemotesView::new();
+        v.local_git = me();
+        let mut list = vec![r("desk", "pane-git-desk")];
+        tested_git(&mut v, "pane-git-desk", Some(("", "")));
+        assert!(
+            v.footer(&list).contains("G git name"),
+            "{}",
+            v.footer(&list)
+        );
+
+        assert_eq!(v.key(Key::Git, &mut list), Effect::None);
+        let Mode::ConfirmGit { row: 0, fix } = &v.mode else {
+            panic!("{:?}", v.mode)
+        };
+        assert_eq!(fix.shown(), "user.name = Ann\nuser.email = ann@example.com");
+        assert_eq!(v.footer(&list), "Enter set them · Esc cancel");
+        assert_eq!(v.key(Key::Esc, &mut list), Effect::None);
+        assert_eq!(v.mode, Mode::Browse);
+        assert_eq!(v.git_fix, None, "Esc kept nothing to write");
+
+        v.key(Key::Git, &mut list);
+        assert_eq!(v.key(Key::Enter, &mut list), Effect::SetGit(0));
+        assert_eq!(v.mode, Mode::Browse);
+        assert_eq!(
+            v.git_fix.as_ref().map(|f| f.shown()).as_deref(),
+            Some("user.name = Ann\nuser.email = ann@example.com")
+        );
+        assert!(v.message.as_deref().unwrap().contains("desk"));
+    }
+
+    /// Nothing to copy: G says why and opens no confirm.
+    #[test]
+    fn g_with_nothing_to_copy_says_why() {
+        let mut v = RemotesView::new();
+        v.local_git = me();
+        let mut list = vec![r("desk", "pane-git-why")];
+        let mut said = |v: &mut RemotesView| {
+            assert_eq!(v.key(Key::Git, &mut list), Effect::None);
+            assert_eq!(v.mode, Mode::Browse);
+            v.message.clone().unwrap()
+        };
+        assert!(said(&mut v).contains("Test desk first"));
+        tested_git(&mut v, "pane-git-why", None);
+        assert_eq!(said(&mut v), "git is not installed on desk");
+        tested_git(&mut v, "pane-git-why", Some(("Bo", "bo@x")));
+        assert!(said(&mut v).contains("already has"));
+        v.local_git = Default::default();
+        tested_git(&mut v, "pane-git-why", Some(("", "")));
+        assert!(said(&mut v).contains("This PC has no git name"));
+        let list = vec![r("desk", "pane-git-why")];
+        assert!(!v.footer(&list).contains("G git") || v.git_lacks(0, &list));
+        tested_git(&mut v, "pane-git-why", Some(("Bo", "bo@x")));
+        assert!(!v.footer(&list).contains("G git"));
+    }
+
+    /// A value the Remote already has is never in what is written.
+    #[test]
+    fn only_the_missing_git_value_is_offered() {
+        let mut v = RemotesView::new();
+        v.local_git = me();
+        let mut list = vec![r("desk", "pane-git-half")];
+        tested_git(&mut v, "pane-git-half", Some(("Bo", "")));
+        v.key(Key::Git, &mut list);
+        let Mode::ConfirmGit { fix, .. } = &v.mode else {
+            panic!("{:?}", v.mode)
+        };
+        assert_eq!(fix.shown(), "user.email = ann@example.com");
     }
 }

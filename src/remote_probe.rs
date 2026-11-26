@@ -240,6 +240,18 @@ pub struct TestReport {
     pub bash: bool,
     /// Agent CLIs from `AGENTS` found on the Remote's PATH.
     pub agents: Vec<String>,
+    /// `git` on the Remote; `None` = not installed.
+    pub git: Option<GitInfo>,
+}
+
+/// What Test read of a Remote's `git`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GitInfo {
+    /// `git --version` without its "git version " lead.
+    pub version: String,
+    /// The global `user.name` and `user.email`; blank = not set.
+    pub name: String,
+    pub email: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -312,6 +324,9 @@ pub fn stage2_line(family: Family) -> String {
             script.push_str(&format!(
                 ") {{ if (Get-Command $c) {{ \"{MARK} have $c\" }} else {{ \"{MARK} miss $c\" }} }}\n"
             ));
+            script.push_str(&format!(
+                "if (Get-Command git) {{ \"{MARK} git $(git --version)\"; \"{MARK} gitname $(git config --global user.name)\"; \"{MARK} gitemail $(git config --global user.email)\" }} else {{ \"{MARK} nogit\" }}\n"
+            ));
             // 5.1 is on every Windows; it is the one that can look for pwsh.
             format!(
                 "powershell -NoLogo -NonInteractive -EncodedCommand {}",
@@ -320,7 +335,7 @@ pub fn stage2_line(family: Family) -> String {
         }
         Family::Posix => {
             let script = format!(
-                "echo \"{MARK} shell ${{SHELL:-sh}}\"\nexec \"${{SHELL:-sh}}\" -lic 'for c in curl bash {}; do if command -v \"$c\" >/dev/null 2>&1; then echo \"{MARK} have $c\"; else echo \"{MARK} miss $c\"; fi; done'\n",
+                "echo \"{MARK} shell ${{SHELL:-sh}}\"\nexec \"${{SHELL:-sh}}\" -lic 'for c in curl bash {}; do if command -v \"$c\" >/dev/null 2>&1; then echo \"{MARK} have $c\"; else echo \"{MARK} miss $c\"; fi; done; if command -v git >/dev/null 2>&1; then echo \"{MARK} git $(git --version 2>/dev/null)\"; echo \"{MARK} gitname $(git config --global user.name 2>/dev/null)\"; echo \"{MARK} gitemail $(git config --global user.email 2>/dev/null)\"; else echo \"{MARK} nogit\"; fi'\n",
                 AGENTS.join(" ")
             );
             crate::remote::posix_line(&script)
@@ -333,6 +348,7 @@ pub fn parse_tools(family: Family, stdout: &str) -> Option<TestReport> {
     let mut have = Vec::new();
     let mut login_shell = None;
     let mut any = false;
+    let mut git: Option<GitInfo> = None;
     for line in stdout.lines() {
         let Some(rest) = line.trim().strip_prefix(MARK) else {
             continue;
@@ -345,6 +361,14 @@ pub fn parse_tools(family: Family, stdout: &str) -> Option<TestReport> {
             any = true;
         } else if let Some(path) = rest.strip_prefix("shell ") {
             login_shell = Some(path.trim().to_string());
+        } else if let Some(name) = rest.strip_prefix("gitname") {
+            git.get_or_insert_default().name = name.trim().to_string();
+        } else if let Some(email) = rest.strip_prefix("gitemail") {
+            git.get_or_insert_default().email = email.trim().to_string();
+        } else if let Some(version) = rest.strip_prefix("git ") {
+            let v = version.trim();
+            git.get_or_insert_default().version =
+                v.strip_prefix("git version ").unwrap_or(v).to_string();
         }
     }
     if !any {
@@ -366,6 +390,7 @@ pub fn parse_tools(family: Family, stdout: &str) -> Option<TestReport> {
             .filter(|a| has(a))
             .map(|a| a.to_string())
             .collect(),
+        git,
     })
 }
 
@@ -1085,6 +1110,7 @@ mod tests {
             curl: false,
             bash: true,
             agents: vec!["claude".into()],
+            git: None,
         });
         assert_eq!(
             r.summary(),
@@ -1096,6 +1122,7 @@ mod tests {
             curl: true,
             bash: false,
             agents: vec![],
+            git: None,
         });
         assert_eq!(r.summary(), "Login works · PowerShell · curl found");
         assert!(
@@ -1112,5 +1139,33 @@ mod tests {
             parse_config_hosts(cfg),
             vec!["desk", "laptop", "garage", "pi"]
         );
+    }
+
+    /// Test reads git's version and the global name and email; a blank
+    /// value is "not set", and no git at all is `None`.
+    #[test]
+    fn git_is_read_with_its_name_and_email() {
+        let out = "motd\nforeman-probe have curl\nforeman-probe git git version 2.43.0\nforeman-probe gitname Ann O'Dev\nforeman-probe gitemail ann@example.com\n";
+        let r = parse_tools(Family::Posix, out).unwrap();
+        assert_eq!(
+            r.git,
+            Some(GitInfo {
+                version: "2.43.0".into(),
+                name: "Ann O'Dev".into(),
+                email: "ann@example.com".into(),
+            })
+        );
+        // Neither set: the lines come back with nothing after the word.
+        let out = "foreman-probe miss curl\r\nforeman-probe git git version 2.45.1.windows.1\r\nforeman-probe gitname \r\nforeman-probe gitemail\r\n";
+        let g = parse_tools(Family::Windows, out).unwrap().git.unwrap();
+        assert_eq!(
+            (g.version.as_str(), g.name.as_str(), g.email.as_str()),
+            ("2.45.1.windows.1", "", "")
+        );
+        let r = parse_tools(
+            Family::Posix,
+            "foreman-probe have curl\nforeman-probe nogit\n",
+        );
+        assert_eq!(r.unwrap().git, None);
     }
 }

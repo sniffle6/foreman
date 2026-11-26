@@ -123,6 +123,20 @@ is for changing the feature.
 - **The Windows-Remote folder create has never run.** The PowerShell line
   that checks the parent and creates the folder is only matched as text in
   the unit tests.
+- **A Remote's git line is from the last Test, global config only.** Test
+  reads `git --version` and `git config --global user.name/email` through
+  the login shell. A name set in one repo, or in the system config, shows
+  as "not set". Nothing is read until T is pressed.
+- **"Use this PC's" writes only what the Remote lacks**, to its global git
+  config, after a confirm that shows the values (`remote_git::fix`). A
+  value the Remote has is never replaced. The values ride as environment
+  variables, because the login shell that finds `git` would otherwise parse
+  them. A value holding `"` is refused: a Windows Remote cannot carry it.
+- **This PC's git name is read on the G key or the button**, by running
+  `git` twice on the UI thread. Never call `remote_git::local_identity`
+  per frame. Under test it is not run: `RemotesView::local_git` stands in.
+- **The Windows-Remote git lines and write have never run**, like the rest
+  of the Windows-Remote scripts.
 - **Agent-state badges: Claude on a POSIX Remote only.** Its hooks ride the
   launch as `--settings` and post to the Tunnel's `/hook`; gotchas are in
   `docs/agent-state.md`. Codex, Grok and Windows Remotes post no events, so

@@ -756,6 +756,7 @@ mod tests {
             curl,
             bash,
             agents: agents.iter().map(|a| a.to_string()).collect(),
+            git: None,
         }
     }
 

@@ -55,6 +55,7 @@ mod release;
 mod remote;
 mod remote_browse;
 mod remote_browse_ui;
+mod remote_git;
 mod remote_install;
 mod remote_probe;
 mod remotes_pane;

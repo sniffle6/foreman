@@ -17531,6 +17531,7 @@ mod tests {
                         curl: true,
                         bash: true,
                         agents: agents.iter().map(|a| a.to_string()).collect(),
+                        git: None,
                     })),
                 },
             )
